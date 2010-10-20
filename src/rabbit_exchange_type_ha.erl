@@ -36,7 +36,12 @@ validate(#exchange { arguments = Args }) ->
         undefined ->
             rabbit_misc:protocol_error(
               precondition_failed,
-              "No ha-nodes argument in exchange declaration");
+              "No ~s argument in exchange declaration",
+              [binary_to_list(?HA_NODES_KEY)]);
+        {array, []} ->
+            rabbit_misc:protocol_error(
+              precondition_failed,
+              "An HA exchange needs at least one initial node", []);
         AmqpArray ->
             Nodes = node_array_to_nodes(AmqpArray),
             case Nodes -- mnesia:system_info(running_db_nodes) of
@@ -45,9 +50,8 @@ validate(#exchange { arguments = Args }) ->
                 NotRunning ->
                     rabbit_misc:protocol_error(
                       precondition_failed,
-                      lists:flatten(
-                        ["Nodes indicated in arguments, but not running: ",
-                         io_lib:format("~w", NotRunning)]))
+                      "Nodes indicated in arguments, but not running: ~w",
+                      NotRunning)
             end
     end.
 
@@ -60,12 +64,12 @@ delete(_X, []) -> ok.
 add_binding(_X, _B) ->
     rabbit_misc:protocol_error(
       not_allowed,
-      "cannot create bindings with an HA exchange as the binding source").
+      "cannot create bindings with an HA exchange as the binding source", []).
 
 remove_bindings(_X, _Bs) ->
     rabbit_misc:protocol_error(
       not_allowed,
-      "cannot create bindings with an HA exchange as the binding source").
+      "cannot create bindings with an HA exchange as the binding source", []).
 
 assert_args_equivalence(X, Args) ->
     rabbit_exchange:assert_args_equivalence(X, Args).
