@@ -35,6 +35,7 @@ start_link() ->
     supervisor2:start_link({local, ?SERVER}, ?MODULE, []).
 
 start_child(Args) ->
+    application:start(rabbit_ha), %% ensure it's started
     supervisor2:start_child(?SERVER, Args).
 
 init([]) ->

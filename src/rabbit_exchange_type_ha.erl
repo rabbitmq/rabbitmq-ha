@@ -77,15 +77,8 @@ validate(#exchange { arguments = Args }) ->
     end.
 
 create(#exchange { arguments = Args } = X) ->
-    Nodes = node_array_to_nodes(rabbit_misc:table_lookup(Args, ?HA_NODES_KEY)),
-    case lists:member(node(), Nodes) of
-        true ->
-            application:start(rabbit_ha), %% ensure it's started
-            rabbit_ha_sup:start_child(X), %% it might already exist
-            ok;
-        false ->
-            ok
-    end.
+    ok = ensure_ha_queues(X, node_array_to_nodes(
+                               rabbit_misc:table_lookup(Args, ?HA_NODES_KEY))).
 
 recover(_X, []) -> ok.
 
@@ -120,22 +113,35 @@ maybe_binary_to_atom(Binary) when is_binary(Binary) ->
     end.
 
 ensure_queues(QNameNodes) ->
-    {QNames, Keys} =
-        lists:foldl(
-          fun ({QName, Node}, {QNamesAcc, KeysAcc}) ->
-                  {[QName | QNamesAcc],
-                   case rabbit_amqqueue:lookup(QName) of
-                       {ok, #amqqueue{}} ->
-                           KeysAcc;
-                       {error, not_found} ->
-                           [rpc:async_call(
-                              Node, rabbit_amqqueue, declare,
-                              [QName, false, true, [], none]) | KeysAcc]
-                   end}
-          end, {[], []}, QNameNodes),
-    ok = lists:foldl(
-           fun (Key, ok) ->
-                   {new, #amqqueue{}} = rpc:yield(Key),
-                   ok
-           end, ok, Keys),
-    QNames.
+    foldl_rpc(
+      fun ({QName, Node}, QNamesAcc, KeysAcc) ->
+              {[QName | QNamesAcc],
+               case rabbit_amqqueue:lookup(QName) of
+                   {ok, #amqqueue{}} ->
+                       KeysAcc;
+                   {error, not_found} ->
+                       [rpc:async_call(
+                          Node, rabbit_amqqueue, declare,
+                          [QName, false, true, [], none]) | KeysAcc]
+               end}
+      end, [], QNameNodes,
+      fun ({new, #amqqueue {}}) -> ok end).
+
+ensure_ha_queues(X, Nodes) ->
+    ok = foldl_rpc(
+           fun (Node, ok, KeysAcc) ->
+                   {ok, [rpc:async_call(Node, rabbit_ha_sup, start_child, [[X]])
+                         | KeysAcc]}
+           end, ok, Nodes,
+           fun ({ok, _Pid})                       -> ok;
+               ({error, {already_started, _Pid}}) -> ok
+           end).
+
+foldl_rpc(Fun, Init, List, ValidateFun) ->
+    {Result, Keys} = lists:foldl(
+                       fun (Elem, {Acc, KeysAcc}) ->
+                               Fun(Elem, Acc, KeysAcc)
+                       end, {Init, []}, List),
+    ok =
+        lists:foldl(fun (Key, ok) -> ValidateFun(rpc:yield(Key)) end, ok, Keys),
+    Result.
