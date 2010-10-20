@@ -1,0 +1,107 @@
+-module(rabbit_exchange_type_ha).
+
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit_exchange_type_spec.hrl").
+
+-behaviour(rabbit_exchange_type).
+
+-export([description/0, route/2]).
+-export([validate/1, create/1, recover/2, delete/2, add_binding/2,
+         remove_bindings/2, assert_args_equivalence/2]).
+
+-define(HA_NODES_KEY, <<"ha-nodes">>).
+
+-rabbit_boot_step({?MODULE,
+                   [{description, "exchange type ha"},
+                    {mfa,         {rabbit_exchange_type_registry, register,
+                                   [<<"x-ha">>, ?MODULE]}},
+                    {requires,    rabbit_exchange_type_registry},
+                    {enables,     kernel_ready}]}).
+
+description() ->
+    [{name, <<"x-ha">>},
+     {description, <<"HA exchange type">>}].
+
+route(#exchange{ name = XName, arguments = Args }, _Delivery) ->
+    Me = self(),
+    Nodes = node_array_to_nodes(rabbit_misc:table_lookup(Args, ?HA_NODES_KEY)),
+    ensure_queues(
+      [{rabbit_misc:r(XName, queue, << (XName#resource.name)/binary,
+                                       (term_to_binary(Node))/binary,
+                                       (term_to_binary(Me))/binary >>),
+        Node} || Node <- Nodes]).
+
+validate(#exchange { arguments = Args }) ->
+    case rabbit_misc:table_lookup(Args, ?HA_NODES_KEY) of
+        undefined ->
+            rabbit_misc:protocol_error(
+              precondition_failed,
+              "No ha-nodes argument in exchange declaration");
+        AmqpArray ->
+            Nodes = node_array_to_nodes(AmqpArray),
+            case Nodes -- mnesia:system_info(running_db_nodes) of
+                [] ->
+                    ok;
+                NotRunning ->
+                    rabbit_misc:protocol_error(
+                      precondition_failed,
+                      lists:flatten(
+                        ["Nodes indicated in arguments, but not running: ",
+                         io_lib:format("~w", NotRunning)]))
+            end
+    end.
+
+create(_X) -> ok.
+
+recover(_X, []) -> ok.
+
+delete(_X, []) -> ok.
+
+add_binding(_X, _B) ->
+    rabbit_misc:protocol_error(
+      not_allowed,
+      "cannot create bindings with an HA exchange as the binding source").
+
+remove_bindings(_X, _Bs) ->
+    rabbit_misc:protocol_error(
+      not_allowed,
+      "cannot create bindings with an HA exchange as the binding source").
+
+assert_args_equivalence(X, Args) ->
+    rabbit_exchange:assert_args_equivalence(X, Args).
+
+%%----------------------------------------------------------------------------
+
+node_array_to_nodes({array, Array}) when is_list(Array) ->
+    [maybe_binary_to_atom(Node) || {longstr, Node} <- Array].
+
+maybe_binary_to_atom(Binary) when is_binary(Binary) ->
+    case get({binary_as_atom, Binary}) of
+        undefined ->
+            Atom = binary_to_atom(Binary, utf8),
+            undefined = put({binary_as_atom, Binary}, Atom),
+            Atom;
+        Atom when is_atom(Atom) ->
+            Atom
+    end.
+
+ensure_queues(QNameNodes) ->
+    {QNames, Keys} =
+        lists:foldl(
+          fun ({QName, Node}, {QNamesAcc, KeysAcc}) ->
+                  {[QName | QNamesAcc],
+                   case rabbit_amqqueue:lookup(QName) of
+                       {ok, #amqqueue{}} ->
+                           KeysAcc;
+                       {error, not_found} ->
+                           [rpc:async_call(
+                              Node, rabbit_amqqueue, declare,
+                              [QName, false, true, [], none]) | KeysAcc]
+                   end}
+          end, {[], []}, QNameNodes),
+    ok = lists:foldl(
+           fun (Key, ok) ->
+                   {new, #amqqueue{}} = rpc:yield(Key),
+                   ok
+           end, ok, Keys),
+    QNames.

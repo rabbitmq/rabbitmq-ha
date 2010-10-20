@@ -1,0 +1,11 @@
+~$
+\.beam$
+^dist/
+^deps/
+^deps.mk$
+^priv$
+^cover/
+^ebin/rabbit_ha.app
+^rabbit-test-output$
+^tmp/
+^plugins/
