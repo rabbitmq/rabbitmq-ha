@@ -55,7 +55,16 @@ validate(#exchange { arguments = Args }) ->
             end
     end.
 
-create(_X) -> ok.
+create(#exchange { arguments = Args } = X) ->
+    Nodes = node_array_to_nodes(rabbit_misc:table_lookup(Args, ?HA_NODES_KEY)),
+    case lists:member(node(), Nodes) of
+        true ->
+            application:start(rabbit_ha), %% ensure it's started
+            rabbit_ha_sup:start_child(X), %% it might already exist
+            ok;
+        false ->
+            ok
+    end.
 
 recover(_X, []) -> ok.
 
