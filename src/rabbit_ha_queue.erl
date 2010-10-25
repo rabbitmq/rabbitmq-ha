@@ -62,10 +62,15 @@ handle_cast(link_to_neighbours, State = #state { name = Name }) ->
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
             State = #state { upstream   = Upstream,
-                             downstream = Downstream }) ->
+                             downstream = Downstream,
+                             server     = Server}) ->
     case detect_neighbour_death(MRef, [Upstream, Downstream]) of
         not_found -> {noreply, State};
         Node      -> Args = remove_node_from_exchange_args(Node, State),
+                     %% after removing from mnesia, make sure the dead
+                     %% node knows about it (it may have immediately
+                     %% come back up and not noticed it died)
+                     ok = link_to_neighbours({Server, Node}),
                      link_neighbours_or_stop(Args, State)
     end.
 
