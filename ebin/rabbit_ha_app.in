@@ -1,0 +1,13 @@
+{application, rabbit_ha,
+ [{description, "Highly available queues for RabbitMQ"},
+  {vsn, "%%VSN%%"},
+  {modules, [
+    rabbit_exchange_type_ha
+  ]},
+  {registered, [rabbit_ha,
+                rabbit_ha_queue,
+                rabbit_ha_sup,
+                rabbit_exchange_type_ha]},
+  {env, []},
+  {mod, {rabbit_ha, []}},
+  {applications, [kernel, stdlib, rabbit]}]}.
