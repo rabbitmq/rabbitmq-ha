@@ -5,6 +5,7 @@
     rabbit_exchange_type_ha
   ]},
   {registered, [rabbit_ha,
+                rabbit_ha_misc,
                 rabbit_ha_queue,
                 rabbit_ha_sup,
                 rabbit_exchange_type_ha]},

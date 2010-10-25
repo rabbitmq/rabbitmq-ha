@@ -30,8 +30,6 @@
 -export([validate/1, create/1, recover/2, delete/2, add_binding/2,
          remove_bindings/2, assert_args_equivalence/2]).
 
--define(HA_NODES_KEY, <<"ha-nodes">>).
-
 -rabbit_boot_step({?MODULE,
                    [{description, "exchange type ha"},
                     {mfa,         {rabbit_exchange_type_registry, register,
@@ -45,40 +43,27 @@ description() ->
 
 route(#exchange{ name = XName, arguments = Args }, _Delivery) ->
     Me = self(),
-    Nodes = node_array_to_nodes(rabbit_misc:table_lookup(Args, ?HA_NODES_KEY)),
+    Nodes = nodes(Args),
     ensure_queues(
       [{rabbit_misc:r(XName, queue, << (XName#resource.name)/binary,
                                        (term_to_binary(Node))/binary,
                                        (term_to_binary(Me))/binary >>),
         Node} || Node <- Nodes]).
 
-validate(#exchange { arguments = Args }) ->
-    case rabbit_misc:table_lookup(Args, ?HA_NODES_KEY) of
-        undefined ->
+validate(Exchange) ->
+    case rabbit_ha_misc:ha_nodes_or_die(Exchange)
+        -- mnesia:system_info(running_db_nodes) of
+        [] ->
+            ok;
+        NotRunning ->
             rabbit_misc:protocol_error(
               precondition_failed,
-              "No ~s argument in exchange declaration",
-              [binary_to_list(?HA_NODES_KEY)]);
-        {array, []} ->
-            rabbit_misc:protocol_error(
-              precondition_failed,
-              "An HA exchange needs at least one initial node", []);
-        AmqpArray ->
-            Nodes = node_array_to_nodes(AmqpArray),
-            case Nodes -- mnesia:system_info(running_db_nodes) of
-                [] ->
-                    ok;
-                NotRunning ->
-                    rabbit_misc:protocol_error(
-                      precondition_failed,
-                      "Nodes indicated in arguments, but not running: ~w",
-                      NotRunning)
-            end
+              "Nodes indicated in arguments, but not running: ~w",
+              NotRunning)
     end.
 
 create(#exchange { arguments = Args } = X) ->
-    ok = ensure_ha_queues(X, node_array_to_nodes(
-                               rabbit_misc:table_lookup(Args, ?HA_NODES_KEY))).
+    ok = ensure_ha_queues(X, rabbit_ha_misc:ha_nodes(Args)).
 
 recover(_X, []) -> ok.
 
@@ -98,19 +83,6 @@ assert_args_equivalence(X, Args) ->
     rabbit_exchange:assert_args_equivalence(X, Args).
 
 %%----------------------------------------------------------------------------
-
-node_array_to_nodes({array, Array}) when is_list(Array) ->
-    [maybe_binary_to_atom(Node) || {longstr, Node} <- Array].
-
-maybe_binary_to_atom(Binary) when is_binary(Binary) ->
-    case get({binary_as_atom, Binary}) of
-        undefined ->
-            Atom = binary_to_atom(Binary, utf8),
-            undefined = put({binary_as_atom, Binary}, Atom),
-            Atom;
-        Atom when is_atom(Atom) ->
-            Atom
-    end.
 
 ensure_queues(QNameNodes) ->
     foldl_rpc(
