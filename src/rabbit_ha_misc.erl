@@ -23,7 +23,7 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--export([ha_nodes_or_die/1, ha_nodes/1, filter_out_ha_node/2]).
+-export([ha_nodes_or_die/1, ha_nodes/1, filter_out_ha_node/2, create_queue/2]).
 
 -define(HA_NODES_KEY, <<"ha-nodes">>).
 
@@ -62,3 +62,13 @@ maybe_binary_to_atom(Binary) when is_binary(Binary) ->
         Atom when is_atom(Atom) ->
             Atom
     end.
+
+create_queue(X, QDeclArgs) ->
+    HAQPid = case rabbit_ha_sup:start_child([X]) of
+                 {ok, Pid}                       -> Pid;
+                 {error, {already_started, Pid}} -> Pid
+             end,
+    ok = case apply(rabbit_amqqueue, declare, QDeclArgs) of
+             {new, Q}       -> rabbit_ha_queue:new_producer_queue(HAQPid, Q);
+             {existing, _Q} -> ok
+         end.

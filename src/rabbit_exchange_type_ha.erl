@@ -41,14 +41,14 @@ description() ->
     [{name, <<"x-ha">>},
      {description, <<"HA exchange type">>}].
 
-route(#exchange{ name = XName, arguments = Args }, _Delivery) ->
+route(#exchange{ name = XName, arguments = Args } = X, _Delivery) ->
     Me = self(),
-    Nodes = nodes(Args),
+    Nodes = rabbit_ha_misc:ha_nodes(Args),
     ensure_queues(
-      [{rabbit_misc:r(XName, queue, << (XName#resource.name)/binary,
-                                       (term_to_binary(Node))/binary,
-                                       (term_to_binary(Me))/binary >>),
-        Node} || Node <- Nodes]).
+      X, [{rabbit_misc:r(XName, queue, << (XName#resource.name)/binary,
+                                          (term_to_binary(Node))/binary,
+                                          (term_to_binary(Me))/binary >>),
+           Node} || Node <- Nodes]).
 
 validate(Exchange) ->
     case rabbit_ha_misc:ha_nodes_or_die(Exchange)
@@ -84,7 +84,7 @@ assert_args_equivalence(X, Args) ->
 
 %%----------------------------------------------------------------------------
 
-ensure_queues(QNameNodes) ->
+ensure_queues(X, QNameNodes) ->
     foldl_rpc(
       fun ({QName, Node}, QNamesAcc, KeysAcc) ->
               {[QName | QNamesAcc],
@@ -93,11 +93,11 @@ ensure_queues(QNameNodes) ->
                        KeysAcc;
                    {error, not_found} ->
                        [rpc:async_call(
-                          Node, rabbit_amqqueue, declare,
-                          [QName, false, true, [], none]) | KeysAcc]
+                          Node, rabbit_ha_misc, create_queue,
+                          [X, [QName, false, true, [], none]]) | KeysAcc]
                end}
       end, [], QNameNodes,
-      fun ({new, #amqqueue {}}) -> ok end).
+      fun (ok) -> ok end).
 
 ensure_ha_queues(X, Nodes) ->
     ok = foldl_rpc(

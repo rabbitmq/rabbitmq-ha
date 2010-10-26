@@ -26,7 +26,7 @@
 -include_lib("amqp_client/include/amqp_client.hrl").
 
 -export([start_link/1]).
--export([link_to_neighbours/1]).
+-export([link_to_neighbours/1, new_producer_queue/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3,
@@ -45,6 +45,9 @@ start_link(X = #exchange { name = XName }) ->
 link_to_neighbours(Pid) ->
     gen_server2:cast(Pid, link_to_neighbours).
 
+new_producer_queue(Pid, Q) ->
+    gen_server2:cast(Pid, {new_producer_queue, Q}).
+
 init([#exchange{ name = XName }, Server]) ->
     ok = link_to_neighbours(self()),
     {ok, #state { name       = XName,
@@ -58,12 +61,16 @@ handle_call(_Msg, _From, State) ->
 
 handle_cast(link_to_neighbours, State = #state { name = Name }) ->
     {ok, #exchange { arguments = Args }} = rabbit_exchange:lookup(Name),
-    link_neighbours_or_stop(Args, State).
+    link_neighbours_or_stop(Args, State);
+
+handle_cast({new_producer_queue, Q}, State) ->
+    io:format("~p: new_producer_queue ~p~n", [{self(), node()}, Q]),
+    {noreply, State}.
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
             State = #state { upstream   = Upstream,
                              downstream = Downstream,
-                             server     = Server}) ->
+                             server     = Server }) ->
     case detect_neighbour_death(MRef, [Upstream, Downstream]) of
         not_found -> {noreply, State};
         Node      -> Args = remove_node_from_exchange_args(Node, State),
@@ -82,8 +89,9 @@ code_change(_OldVsn, State, _Extra) ->
 
 prioritise_call(_Msg, _From, _State) -> 0.
 
-prioritise_cast(link_to_neighbours, _State) -> 8;
-prioritise_cast(_Msg,               _State) -> 0.
+prioritise_cast(link_to_neighbours,                _State) -> 8;
+prioritise_cast({new_producer_queue, #amqqueue{}}, _State) -> 8;
+prioritise_cast(_Msg,                              _State) -> 0.
 
 prioritise_info({'DOWN', _MonitorRef, process, _Pid, _Reason}, _State) -> 8;
 prioritise_info(_Msg,                                          _State) -> 0.
@@ -117,7 +125,7 @@ link_neighbours_or_stop(Args, State) ->
             {stop, normal, State1};
         {ok, State1} ->
             {noreply, State1}
-    end.    
+    end.
 
 link_neighbours(Args, State) ->
     Nodes = rabbit_ha_misc:ha_nodes(Args),
