@@ -63,7 +63,7 @@ validate(Exchange) ->
     end.
 
 create(#exchange { arguments = Args } = X) ->
-    ok = ensure_ha_queues(X, rabbit_ha_misc:ha_nodes(Args)).
+    ok = rabbit_ha_misc:ensure_ha_queues(X, rabbit_ha_misc:ha_nodes(Args)).
 
 recover(_X, []) -> ok.
 
@@ -85,7 +85,7 @@ assert_args_equivalence(X, Args) ->
 %%----------------------------------------------------------------------------
 
 ensure_queues(X, QNameNodes) ->
-    foldl_rpc(
+    rabbit_ha_misc:foldl_rpc(
       fun ({QName, Node}, QNamesAcc, KeysAcc) ->
               {[QName | QNamesAcc],
                case rabbit_amqqueue:lookup(QName) of
@@ -98,22 +98,3 @@ ensure_queues(X, QNameNodes) ->
                end}
       end, [], QNameNodes,
       fun (ok) -> ok end).
-
-ensure_ha_queues(X, Nodes) ->
-    ok = foldl_rpc(
-           fun (Node, ok, KeysAcc) ->
-                   {ok, [rpc:async_call(Node, rabbit_ha_sup, start_child, [[X]])
-                         | KeysAcc]}
-           end, ok, Nodes,
-           fun ({ok, _Pid})                       -> ok;
-               ({error, {already_started, _Pid}}) -> ok
-           end).
-
-foldl_rpc(Fun, Init, List, ValidateFun) ->
-    {Result, Keys} = lists:foldl(
-                       fun (Elem, {Acc, KeysAcc}) ->
-                               Fun(Elem, Acc, KeysAcc)
-                       end, {Init, []}, List),
-    ok =
-        lists:foldl(fun (Key, ok) -> ValidateFun(rpc:yield(Key)) end, ok, Keys),
-    Result.

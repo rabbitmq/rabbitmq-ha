@@ -23,7 +23,8 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--export([ha_nodes_or_die/1, ha_nodes/1, filter_out_ha_node/2, create_queue/2]).
+-export([ha_nodes_or_die/1, ha_nodes/1, filter_out_ha_node/2, create_queue/2,
+         foldl_rpc/4, ensure_ha_queues/2]).
 
 -define(HA_NODES_KEY, <<"ha-nodes">>).
 
@@ -72,3 +73,22 @@ create_queue(X, QDeclArgs) ->
              {new, Q}       -> rabbit_ha_queue:new_producer_queue(HAQPid, Q);
              {existing, _Q} -> ok
          end.
+
+ensure_ha_queues(X, Nodes) ->
+    ok = foldl_rpc(
+           fun (Node, ok, KeysAcc) ->
+                   {ok, [rpc:async_call(Node, rabbit_ha_sup, start_child, [[X]])
+                         | KeysAcc]}
+           end, ok, Nodes,
+           fun ({ok, _Pid})                       -> ok;
+               ({error, {already_started, _Pid}}) -> ok
+           end).
+
+foldl_rpc(Fun, Init, List, ValidateFun) ->
+    {Result, Keys} = lists:foldl(
+                       fun (Elem, {Acc, KeysAcc}) ->
+                               Fun(Elem, Acc, KeysAcc)
+                       end, {Init, []}, List),
+    ok =
+        lists:foldl(fun (Key, ok) -> ValidateFun(rpc:yield(Key)) end, ok, Keys),
+    Result.

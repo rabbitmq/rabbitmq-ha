@@ -48,7 +48,7 @@ link_to_neighbours(Pid) ->
 new_producer_queue(Pid, Q) ->
     gen_server2:cast(Pid, {new_producer_queue, Q}).
 
-init([#exchange{ name = XName }, Server]) ->
+init([#exchange{ name = XName } = X, Server]) ->
     ok = link_to_neighbours(self()),
     {ok, #state { name       = XName,
                   upstream   = undefined,
@@ -60,7 +60,8 @@ handle_call(_Msg, _From, State) ->
     {noreply, State}.
 
 handle_cast(link_to_neighbours, State = #state { name = Name }) ->
-    {ok, #exchange { arguments = Args }} = rabbit_exchange:lookup(Name),
+    {ok, #exchange { arguments = Args } = X} = rabbit_exchange:lookup(Name),
+    ok = ensure_neighbours(X),
     link_neighbours_or_stop(Args, State);
 
 handle_cast({new_producer_queue, Q}, State) ->
@@ -73,7 +74,9 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                              server     = Server }) ->
     case detect_neighbour_death(MRef, [Upstream, Downstream]) of
         not_found -> {noreply, State};
-        Node      -> Args = remove_node_from_exchange_args(Node, State),
+        Node      ->
+            io:format("~p Death of ~p ~p~n", [self(), _Pid, _Reason]),
+            Args = remove_node_from_exchange_args(Node, State),
                      %% after removing from mnesia, make sure the dead
                      %% node knows about it (it may have immediately
                      %% come back up and not noticed it died)
@@ -127,12 +130,23 @@ link_neighbours_or_stop(Args, State) ->
             {noreply, State1}
     end.
 
+ensure_neighbours(#exchange{ arguments = Args } = X) ->
+    Nodes = rabbit_ha_misc:ha_nodes(Args),
+    case find_neighbours(node(), Nodes) of
+        not_found ->
+            ok;
+        {Up, Down} ->
+            ok = rabbit_ha_misc:ensure_ha_queues(
+                   X, [Node || Node <- [Up, Down], Node =/= undefined ])
+    end.
+
 link_neighbours(Args, State) ->
     Nodes = rabbit_ha_misc:ha_nodes(Args),
     case find_neighbours(node(), Nodes) of
         not_found ->
             {not_found, State};
         {Up, Down} ->
+            io:format("~p Up/Down: ~p/~p~n", [self(), Up, Down]),
             Upstream = contact_neighbour(Up, State #state.upstream, State),
             Downstream =
                 contact_neighbour(Down, State #state.downstream, State),
@@ -158,6 +172,7 @@ contact_neighbour(undefined, undefined, _State) ->
 contact_neighbour(Neighbour, {Neighbour, _MRef} = Result, _State) ->
     Result;
 contact_neighbour(Neighbour, undefined, #state { server = Server }) ->
+    io:format("~p Monitoring ~p~n", [self(), {Server, Neighbour}]),
     MRef = erlang:monitor(process, {Server, Neighbour}),
     ok = link_to_neighbours({Server, Neighbour}),
     {Neighbour, MRef};
