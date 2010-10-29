@@ -23,7 +23,7 @@
 
 -behaviour(gen_server2).
 
--export([start_link/1, create_table/0, join_ring/1]).
+-export([start_link/2, create_table/0, join_ring/2, broadcast/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -37,14 +37,15 @@
           upstream,
           downstream,
           ring_name,
-          members
+          members,
+          callback,
+          pub_count
         }).
 
 -record(member,
         { id,
           pending_ack,
-          last_ack_seen,
-          pub_count
+          last_ack_seen
         }).
 
 -record(ring, { name, members }).
@@ -58,19 +59,24 @@ create_table() ->
         Err                             -> Err
     end.
 
-join_ring(RingName) ->
-    start_link(RingName).
+start_link(RingName, Callback) ->
+    gen_server2:start_link(?MODULE, [RingName, Callback], []).
 
-start_link(RingName) ->
-    gen_server2:start_link(?MODULE, [RingName], []).
+join_ring(RingName, Callback) ->
+    start_link(RingName, Callback).
 
-init([RingName]) ->
+broadcast(Server, Msg) ->
+    gen_server2:cast(Server, {broadcast, Msg}).
+
+init([RingName, Callback]) ->
     gen_server2:cast(self(), join_ring),
     {ok, #state { self       = self(),
                   upstream   = undefined,
                   downstream = undefined,
                   ring_name  = RingName,
-                  members    = undefined }, hibernate,
+                  members    = undefined,
+                  callback   = Callback,
+                  pub_count  = 0 }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 handle_call({add_new_member, Member}, _From,
@@ -100,6 +106,48 @@ handle_call({add_new_member, Member}, _From,
             {reply, not_most_recently_added, State}
     end.
 
+handle_cast({activity, Msgs}, State = #state { self       = Self,
+                                               downstream = Down,
+                                               members    = Members,
+                                               callback   = Callback }) ->
+    {Members1, Outbound} =
+        lists:foldl(
+          fun ({Id, Pubs, Acks} = Msg, {Members2, Outbound1}) ->
+                  #member { pending_ack = PA, last_ack_seen = LAS } = Member =
+                      find_member_or_blank(Id, Members2),
+                  {PA1, Outbound2} =
+                      case Id of
+                          Self ->
+                              {PA, [{Id, [], [PubNum || {PubNum, _Pub} <- Pubs]}
+                                    | Outbound1]};
+                          _ ->
+                              {queue:join(PA, queue:from_list(Pubs)),
+                               [Msg | Outbound1]}
+                      end,
+                  {PA2, LAS1} = acks(PA1, Acks, LAS),
+                  {dict:store(Id,
+                              Member #member { pending_ack   = PA2,
+                                               last_ack_seen = LAS1 },
+                              Members2),
+                   Outbound2}
+          end, {Members, []}, Msgs),
+    ok = send_downstream(Self, Outbound, Down),
+    ok = callback(Callback, Outbound),
+    {noreply, State #state { members = Members1 }};
+
+handle_cast({broadcast, Msg}, State = #state { self = Self,
+                                               downstream = Down,
+                                               members = Members,
+                                               pub_count = PubCount }) ->
+    PubMsg = {PubCount, Msg},
+    Outbound = [{Self, [PubMsg], []}],
+    ok = send_downstream(Self, Outbound, Down),
+    #member { pending_ack = PA } = Member = find_member_or_blank(Self, Members),
+    Members1 = dict:store(Self,
+                          Member #member { pending_ack = queue:in(PubMsg, PA) },
+                          Members),
+    {noreply, State #state { members = Members1, pub_count = PubCount + 1 }};
+
 handle_cast(join_ring, State = #state { self       = Self,
                                         upstream   = undefined,
                                         downstream = undefined,
@@ -116,7 +164,32 @@ handle_cast(join_ring, State = #state { self       = Self,
 
 handle_cast(check_neighbours, State = #state { ring_name  = RingName }) ->
     {ok, Ring} = read_ring(RingName),
-    {noreply, check_neighbours(Ring, State)}.
+    {noreply, check_neighbours(Ring, State)};
+
+handle_cast({catch_up, Members1}, State = #state { members    = Members,
+                                                   downstream = Down,
+                                                   self       = Self,
+                                                   callback   = Callback }) ->
+    {Members2, Outbound} =
+        dict:fold(
+          fun (Id, #member {}, Acc) when Self =:= Id ->
+                  Acc; %% We're certain to know more about ourselves
+              (Id, #member { pending_ack = PA1, last_ack_seen = LAS1 },
+               {Members3, Outbound1}) ->
+                  #member { pending_ack = PA, last_ack_seen = LAS } = Member =
+                      find_member_or_blank(Id, Members3),
+                  {PA2, Pubs} = subtract_pending_acks(PA1, PA),
+                  LAS2 = lists:max([LAS1, LAS]),
+                  {PA3, Acks} = catch_up_ack(PA2, LAS2, []),
+                  {dict:store(Id,
+                              Member #member { pending_ack   = PA3,
+                                               last_ack_seen = LAS2 },
+                              Members3),
+                   [{Id, Pubs, Acks} | Outbound1]}
+          end, {Members, []}, Members1),
+    ok = send_downstream(Self, Outbound, Down),
+    ok = callback(Callback, Outbound),
+    {noreply, State #state { members = Members2 }}.
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
             State = #state { self       = Self,
@@ -244,3 +317,58 @@ check_neighbours(Ring, State = #state { self       = Self,
     Up2 = ensure_neighbour(Self, Up, Up1),
     Down2 = ensure_neighbour(Self, Down, Down1),
     State #state { upstream = Up2, downstream = Down2 }.
+
+find_member_or_blank(Id, Members) ->
+    case dict:find(Id, Members) of
+        {ok, Result} -> Result;
+        error        -> blank_member(Id)
+    end.
+
+blank_member(Id) ->
+    #member { id            = Id,
+              pending_ack   = queue:new(),
+              last_ack_seen = -1 }.
+
+subtract_pending_acks(Upstream, Mine) ->
+    UpstreamList = queue:to_list(Upstream),
+    case queue:out_r(Mine) of
+        {empty, _Mine} ->
+            {Upstream, UpstreamList};
+        {{value, MostRecentPub}, _Mine} ->
+            case lists:dropwhile(fun (Pub) -> Pub =/= MostRecentPub end,
+                                 UpstreamList) of
+                [] ->
+                    {Mine, []};
+                [MostRecentPub | Pubs] ->
+                    {queue:join(Mine, queue:from_list(Pubs)), Pubs}
+            end
+    end.
+
+acks(Pending, [], LAS) ->
+    {Pending, LAS};
+acks(Pending, [Ack | Acks], LAS) when Ack =:= LAS + 1 ->
+    {{value, {Ack, _Msg}}, Pending1} = queue:out(Pending),
+    acks(Pending1, Acks, Ack).
+
+catch_up_ack(Pending, Ack, Acc) ->
+    case queue:out(Pending) of
+        {{value, {Ack, _Msg}}, Pending1} ->
+            {Pending1, lists:reverse(Acc)};
+        {{value, {Ack1, _Msg}}, Pending1} when Ack1 < Ack ->
+            catch_up_ack(Pending1, Ack, [Ack1 | Acc]);
+        {{value, {_Ack1, _Msg}}, _Pending1} ->
+            {Pending, Acc};
+        {empty, _Pending} when Acc =:= [] ->
+            {Pending, Acc}
+    end.
+
+send_downstream(Self, _Msg, {Self, undefined}) ->
+    ok;
+send_downstream(_Self, [], _Down) ->
+    ok;
+send_downstream(_Self, Msg, {Down, _MRef}) ->
+    gen_server2:cast(Down, {activity, Msg}).
+
+callback(Callback, Msgs) ->
+    [Callback(Pub) || {_Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
+    ok.
