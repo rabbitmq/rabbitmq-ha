@@ -175,7 +175,7 @@
 
 -behaviour(gen_server2).
 
--export([create_table/0, join_group/2, leave_group/1, broadcast/2]).
+-export([create_table/0, join/2, leave/1, broadcast/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -206,17 +206,17 @@ create_table() ->
         Err                                   -> Err
     end.
 
-join_group(GroupName, Callback) ->
+join(GroupName, Callback) ->
     gen_server2:start_link(?MODULE, [GroupName, Callback], []).
 
-leave_group(Server) ->
+leave(Server) ->
     gen_server2:cast(Server, leave).
 
 broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
 
 init([GroupName, Callback]) ->
-    gen_server2:cast(self(), join_group),
+    gen_server2:cast(self(), join),
     Self = self(),
     {ok, #state { self        = Self,
                   upstream    = undefined,
@@ -273,15 +273,15 @@ handle_cast({activity, _Up, _Msgs}, State) ->
 handle_cast({broadcast, Msg}, State) ->
     {noreply, broadcast_internal(Msg, State)};
 
-handle_cast(leave_group, State) ->
+handle_cast(leave, State) ->
     {stop, normal, State};
 
-handle_cast(join_group, State = #state { self       = Self,
-                                         upstream   = undefined,
-                                         downstream = undefined,
-                                         group_name = GroupName,
-                                         members    = undefined,
-                                         callback   = Callback }) ->
+handle_cast(join, State = #state { self       = Self,
+                                   upstream   = undefined,
+                                   downstream = undefined,
+                                   group_name = GroupName,
+                                   members    = undefined,
+                                   callback   = Callback }) ->
     {Group, Members} =
         case maybe_create_group(GroupName, Self) of
             {new, Group1}      -> {Group1, dict:new()};
