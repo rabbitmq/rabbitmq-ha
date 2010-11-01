@@ -250,9 +250,9 @@ handle_call({add_new_member, Member}, _From,
           end),
     case Result of
         {ok, Group2} ->
-            {reply, {ok, Group2, Members}, check_neighbours(Group2, State)};
+            reply({ok, Group2, Members}, check_neighbours(Group2, State));
         not_most_recently_added ->
-            {reply, not_most_recently_added, State}
+            reply(not_most_recently_added, State)
     end.
 
 handle_cast({activity, Up, Msgs}, State = #state { self       = Self,
@@ -265,13 +265,13 @@ handle_cast({activity, Up, Msgs}, State = #state { self       = Self,
     {Members1, Outbound} = lists:foldl(ActivityFun, {Members, []}, Msgs),
     ok = send_downstream(Self, Outbound, Down),
     ok = callback(Callback, Outbound),
-    {noreply, State #state { members = Members1 }};
+    noreply(State #state { members = Members1 });
 
 handle_cast({activity, _Up, _Msgs}, State) ->
-    {noreply, State};
+    noreply(State);
 
 handle_cast({broadcast, Msg}, State) ->
-    {noreply, broadcast_internal(Msg, State)};
+    noreply(broadcast_internal(Msg, State));
 
 handle_cast(leave, State) ->
     {stop, normal, State};
@@ -298,11 +298,11 @@ handle_cast(join, State = #state { self       = Self,
              fun (Id, PendingAcks, MsgsAcc) ->
                      output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
              end, [], Members)),
-    {noreply, State2};
+    noreply(State2);
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
     {ok, Group} = read_group(GroupName),
-    {noreply, check_neighbours(Group, State)};
+    noreply(check_neighbours(Group, State));
 
 handle_cast({catch_up, Up, MembersUp},
             State = #state { self       = Self,
@@ -337,10 +337,10 @@ handle_cast({catch_up, Up, MembersUp},
           end, {Members, []}, AllMembers),
     ok = send_downstream(Self, Outbound, Down),
     ok = callback(Callback, Outbound),
-    {noreply, State #state { members = Members1 }};
+    noreply(State #state { members = Members1 });
 
 handle_cast({catch_up, _Up, _MembersUp}, State) ->
-    {noreply, State}.
+    noreply(State).
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
             State = #state { self       = Self,
@@ -389,7 +389,7 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
              {Neighbour, _MRef} -> gen_server2:cast(Neighbour,
                                                     {catch_up, Self, Members})
          end,
-    {noreply, State2}.
+    noreply(State2).
 
 terminate(_Reason, _State) ->
     ok.
@@ -397,6 +397,11 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+noreply(State) ->
+    {noreply, State, hibernate}.
+
+reply(Reply, State) ->
+    {reply, Reply, State, hibernate}.
 
 %% ---------------------------------------------------------------------------
 %% Group membership management
