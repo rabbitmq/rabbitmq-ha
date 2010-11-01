@@ -537,7 +537,7 @@ send_downstream(Self, Msg, {Down, _MRef}) ->
     gen_server2:cast(Down, {activity, Self, Msg}).
 
 callback(Callback, Msgs) ->
-    [Callback(Pub) || {_Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
+    [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
     ok.
 
 %% ---------------------------------------------------------------------------
