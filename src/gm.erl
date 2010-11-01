@@ -178,7 +178,7 @@
 
 -behaviour(gen_server2).
 
--export([start_link/2, create_table/0, join_group/2, broadcast/2]).
+-export([create_table/0, join_group/2, leave_group/1, broadcast/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -209,11 +209,11 @@ create_table() ->
         Err                                   -> Err
     end.
 
-start_link(GroupName, Callback) ->
+join_group(GroupName, Callback) ->
     gen_server2:start_link(?MODULE, [GroupName, Callback], []).
 
-join_group(GroupName, Callback) ->
-    start_link(GroupName, Callback).
+leave_group(Server) ->
+    gen_server2:cast(Server, leave).
 
 broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
@@ -283,6 +283,9 @@ handle_cast({broadcast, Msg}, State = #state { self       = Self,
     ok = send_downstream(Self, Outbound, Down),
     Members1 = with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, Members),
     {noreply, State #state { members = Members1, pub_count = PubCount + 1 }};
+
+handle_cast(leave_group, State) ->
+    {stop, normal, State};
 
 handle_cast(join_group, State = #state { self       = Self,
                                          upstream   = undefined,
