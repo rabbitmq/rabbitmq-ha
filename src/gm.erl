@@ -172,9 +172,6 @@
 %% change is that members not in the recipients list do not invoke
 %% their callback for such messages.
 %%
-%% 2. Expose membership changes through the callback.
-%%
-
 
 -behaviour(gen_server2).
 
@@ -219,7 +216,6 @@ broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
 
 init([GroupName, Callback]) ->
-    process_flag(trap_exit, true),
     gen_server2:cast(self(), join_group),
     Self = self(),
     {ok, #state { self        = Self,
@@ -274,15 +270,8 @@ handle_cast({activity, Up, Msgs}, State = #state { self       = Self,
 handle_cast({activity, _Up, _Msgs}, State) ->
     {noreply, State};
 
-handle_cast({broadcast, Msg}, State = #state { self       = Self,
-                                               downstream = Down,
-                                               members    = Members,
-                                               pub_count  = PubCount }) ->
-    PubMsg = {PubCount, Msg},
-    Outbound = [{Self, [PubMsg], []}],
-    ok = send_downstream(Self, Outbound, Down),
-    Members1 = with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, Members),
-    {noreply, State #state { members = Members1, pub_count = PubCount + 1 }};
+handle_cast({broadcast, Msg}, State) ->
+    {noreply, broadcast_internal(Msg, State)};
 
 handle_cast(leave_group, State) ->
     {stop, normal, State};
@@ -296,19 +285,20 @@ handle_cast(join_group, State = #state { self       = Self,
     {Group, Members} =
         case maybe_create_group(GroupName, Self) of
             {new, Group1}      -> {Group1, dict:new()};
-            {existing, Group1} -> internal_join_group(Self, Group1)
+            {existing, Group1} -> join_group_internal(Self, Group1)
         end,
     {Up, Down} = find_neighbours(Group, Self),
     State1 = State #state { upstream   = {Up, maybe_monitor(Up, Self)},
                             downstream = {Down, maybe_monitor(Down, Self)},
                             members    = Members },
+    State2 = broadcast_internal({member_joined, GroupName, Self}, State1),
     ok = callback(
            Callback,
            dict:fold(
              fun (Id, PendingAcks, MsgsAcc) ->
                      output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
              end, [], Members)),
-    {noreply, State1};
+    {noreply, State2};
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
     {ok, Group} = read_group(GroupName),
@@ -358,21 +348,24 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                              downstream = Down,
                              group_name = GroupName,
                              members    = Members,
-                             myselves   = Myselves }) ->
-    Member = case {Up, Down} of
-                 {{Member1, MRef}, _} -> Member1;
-                 {_, {Member1, MRef}} -> Member1;
-                 _                    -> unknown
-             end,
-    Myselves1 = case Up of
-                    {Member, MRef} -> sets:add_element(Member, Myselves);
-                    _              -> Myselves
-                end,
-    Group =
+                             myselves   = Myselves,
+                             callback   = Callback }) ->
+    {Member, State1} =
+        case {Up, Down} of
+            {{Member1, MRef}, _} ->
+                Msg = {member_left, Member1},
+                Callback(Self, Msg),
+                Myselves1 = sets:add_element(Member1, Myselves),
+                {Member1, broadcast_internal(Msg, State #state { myselves = Myselves1 })};
+            {_, {Member1, MRef}} ->
+                {Member1, State};
+            _ ->
+                {unknown, State}
+        end,
+    {ok, Group} =
         case Member of
             unknown ->
-                {ok, Group1} = read_group(GroupName),
-                Group1;
+                read_group(GroupName);
             _ ->
                 {atomic, Group1} =
                     mnesia:sync_transaction(
@@ -387,20 +380,18 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                                               Group3
                               end
                       end),
-                Group1
+                {ok, Group1}
         end,
-    State1 = #state { downstream = Down1 } =
-        check_neighbours(Group, State #state { myselves = Myselves1 }),
+    State2 = #state { downstream = Down1 } = check_neighbours(Group, State1),
     ok = case Down1 of
              Down               -> ok;
              {Self, undefined}  -> ok;
              {Neighbour, _MRef} -> gen_server2:cast(Neighbour,
                                                     {catch_up, Self, Members})
          end,
-    {noreply, State1}.
+    {noreply, State2}.
 
 terminate(_Reason, _State) ->
-    io:format("~p death ~p ~p~n", [self(), _Reason, _State]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -472,13 +463,13 @@ ensure_neighbour(Self, {RealNeighbour, MRef}, Neighbour) ->
                 {Neighbour, maybe_monitor(Neighbour, Self)}
     end.
 
-internal_join_group(Self, #gm_group { name = GroupName, members = Members }) ->
+join_group_internal(Self, #gm_group { name = GroupName, members = Members }) ->
     [MostRecentlyAdded | _] = lists:reverse(Members),
     case gen_server2:call(
            MostRecentlyAdded, {add_new_member, Self}, infinity) of
         {ok, Group, Members1}   -> {Group, Members1};
         not_most_recently_added -> {ok, Group} = read_group(GroupName),
-                                   internal_join_group(Self, Group)
+                                   join_group_internal(Self, Group)
     end.
 
 check_neighbours(Group, State = #state { self       = Self,
@@ -542,6 +533,16 @@ send_downstream(Self, Msg, {Down, _MRef}) ->
 callback(Callback, Msgs) ->
     [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
     ok.
+
+broadcast_internal(Msg, State = #state { self       = Self,
+                                         downstream = Down,
+                                         members    = Members,
+                                         pub_count  = PubCount }) ->
+    PubMsg = {PubCount, Msg},
+    Outbound = [{Self, [PubMsg], []}],
+    ok = send_downstream(Self, Outbound, Down),
+    Members1 = with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, Members),
+    State #state { members = Members1, pub_count = PubCount + 1 }.
 
 %% ---------------------------------------------------------------------------
 %% Members helpers
