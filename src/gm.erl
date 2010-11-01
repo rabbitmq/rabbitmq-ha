@@ -324,21 +324,21 @@ handle_cast({catch_up, Up, MembersUp},
         lists:foldl(
           fun (Id, MembersOutbound) ->
                   PAUp = find_member_or_blank(Id, MembersUp),
-                  with_member_and_outbound(
+                  with_member_acc(
                     fun (PA, Outbound1) ->
                             case sets:is_element(Id, Myselves) of
                                 true ->
                                     {_AcksInFlight, Pubs, PA1} =
                                         find_prefix_common_suffix(PAUp, PA),
                                     {PA1, output_cons(Outbound1, Id, [],
-                                                      pubs_to_acks(Pubs))};
+                                                      acks_from_queue(Pubs))};
                                 false ->
                                     {Acks, Common, Pubs} =
                                         find_prefix_common_suffix(PA, PAUp),
                                     {queue:join(Common, Pubs),
                                      output_cons(Outbound1, Id,
                                                  queue:to_list(Pubs),
-                                                 pubs_to_acks(Acks))}
+                                                 acks_from_queue(Acks))}
                             end
                     end, Id, MembersOutbound)
           end, {Members, []}, AllMembers),
@@ -547,9 +547,9 @@ callback(Callback, Msgs) ->
 with_member(Fun, Id, Members) ->
     maybe_store_member(Id, Fun(find_member_or_blank(Id, Members)), Members).
 
-with_member_and_outbound(Fun, Id, {Members, Outbound}) ->
-    {Member1, Outbound1} = Fun(find_member_or_blank(Id, Members), Outbound),
-    {maybe_store_member(Id, Member1, Members), Outbound1}.
+with_member_acc(Fun, Id, {Members, Acc}) ->
+    {Member1, Acc1} = Fun(find_member_or_blank(Id, Members), Acc),
+    {maybe_store_member(Id, Member1, Members), Acc1}.
 
 find_member_or_blank(Id, Members) ->
     case dict:find(Id, Members) of
@@ -567,34 +567,34 @@ maybe_store_member(Id, Member, Members) ->
     case is_member_empty(Member) of
         true  -> dict:erase(Id, Members);
         false -> dict:store(Id, Member, Members)
-    end.    
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
 %% ---------------------------------------------------------------------------
 
-pubs_to_acks(Pubs) ->
+acks_from_queue(Pubs) ->
     [PubNum || {PubNum, _Msg} <- queue:to_list(Pubs)].
 
-ack_pubs([], Pubs) ->
+apply_acks([], Pubs) ->
     Pubs;
-ack_pubs([PubNum | Acks], Pubs) ->
+apply_acks([PubNum | Acks], Pubs) ->
     {{value, {PubNum, _Msg}}, Pubs1} = queue:out(Pubs),
-    ack_pubs(Acks, Pubs1).
+    apply_acks(Acks, Pubs1).
 
 process_activity_fun(Myselves) ->
     fun ({Id, Pubs, Acks} = Msg, MembersOutbound) ->
-            with_member_and_outbound(
+            with_member_acc(
               fun (PA, Outbound1) ->
                       case sets:is_element(Id, Myselves) of
                           true ->
                               {ToAck, PA1} = find_common(queue:from_list(Pubs),
                                                          PA, queue:new()),
                               {PA1, output_cons(Outbound1, Id, [],
-                                                pubs_to_acks(ToAck))};
+                                                acks_from_queue(ToAck))};
                           false ->
                               PA1 = queue:join(PA, queue:from_list(Pubs)),
-                              {ack_pubs(Acks, PA1), [Msg | Outbound1]}
+                              {apply_acks(Acks, PA1), [Msg | Outbound1]}
                       end
               end, Id, MembersOutbound)
     end.
