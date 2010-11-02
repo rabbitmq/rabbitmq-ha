@@ -197,6 +197,8 @@
 
 -record(gm_group, { name, members }).
 
+-define(TAG, '$gm').
+
 -define(TABLES,
         [{?GROUP_TABLE, [{record_name, gm_group},
                          {attributes, record_info(fields, gm_group)}]}
@@ -276,8 +278,8 @@ handle_cast({activity, Left, Msgs},
     {MembersState1, Outbound} =
         lists:foldl(ActivityFun, {MembersState, []}, Msgs),
     send_right(Self, Outbound, Right),
-    ok = callback(Callback, Outbound),
-    noreply(State #state { members_state = MembersState1 });
+    noreply(callback(Callback, Outbound,
+                     State #state { members_state = MembersState1 }));
 
 handle_cast({activity, _Left, _Msgs}, State) ->
     noreply(State);
@@ -300,14 +302,14 @@ handle_cast(join, State = #state { self          = Self,
     State1 = State #state { left          = {Left, maybe_monitor(Left, Self)},
                             right         = {Right, maybe_monitor(Right, Self)},
                             members_state = MembersState },
-    State2 = broadcast_internal({member_joined, Self}, State1),
-    ok = callback(
-           Callback,
-           dict:fold(
-             fun (Id, PendingAcks, MsgsAcc) ->
-                     output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
-             end, [], MembersState)),
-    noreply(State2);
+    State2 = broadcast_internal({?TAG, {member_joined, Self}}, State1),
+    noreply(
+      callback(
+        Callback,
+        dict:fold(
+          fun (Id, PendingAcks, MsgsAcc) ->
+                  output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
+          end, [], MembersState), State2));
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
     noreply(check_neighbours(read_group(GroupName), State));
@@ -344,8 +346,8 @@ handle_cast({catch_up, Left, MembersStateLeft},
                     end, Id, MembersStateOutbound)
           end, {MembersState, []}, AllMembers),
     send_right(Self, Outbound, Right),
-    ok = callback(Callback, Outbound),
-    noreply(State #state { members_state = MembersState1 });
+    noreply(callback(Callback, Outbound,
+                     State #state { members_state = MembersState1 }));
 
 handle_cast({catch_up, _Left, _MembersStateLeft}, State) ->
     noreply(State).
@@ -379,9 +381,10 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                      State1
              end,
     noreply(case Left of %% original left
-                {Member, _MRef2} -> Msg = {member_left, Member},
-                                    Callback(Self, Msg),
-                                    broadcast_internal(Msg, State2);
+                {Member, _MRef2} -> Msg = {?TAG, {member_left, Member}},
+                                    callback(Callback,
+                                             [{Self, [{undefined, Msg}], []}],
+                                             broadcast_internal(Msg, State2));
                 _                -> State2
             end).
 
@@ -513,7 +516,7 @@ check_neighbours(Group = #gm_group {}, State = #state { self  = Self,
     {Left1, Right1} = find_neighbours(Group, Self),
     Left2 = ensure_neighbour(Self, Left, Left1),
     Right2 = ensure_neighbour(Self, Right, Right1),
-    io:format("~p {~p, ~p}~n", [Self, Left1, Right1]),
+    io:format(".. ~p ==> ~p ==> ~p ..~n", [Left1, Self, Right1]),
     State #state { left = Left2, right = Right2 }.
 
 %% ---------------------------------------------------------------------------
@@ -567,9 +570,24 @@ send_right(Self, Msg, {Right, _MRef}) ->
     ok = gen_server2:cast(Right, {activity, Self, Msg}),
     true.
 
-callback(Callback, Msgs) ->
-    [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
-    ok.
+callback(Callback, Msgs, State) ->
+    lists:foldl(
+      fun ({Id, Pubs, _Acks}, State1) ->
+              lists:foldl(
+                fun ({_PubNum, {?TAG, {member_left, Member} = Pub}},
+                     State2 = #state { members_state = MembersState }) ->
+                        Callback(Id, Pub),
+                        State2 #state { members_state =
+                                            erase_member(Member,
+                                                         MembersState) };
+                    ({_PubNum, {?TAG, Pub}}, State2) ->
+                        Callback(Id, Pub),
+                        State2;
+                    ({_PubNum, Pub}, State2) ->
+                        Callback(Id, Pub),
+                        State2
+                end, State1, Pubs)
+      end, State, Msgs).
 
 broadcast_internal(Msg, State = #state { self          = Self,
                                          right         = Right,
@@ -590,12 +608,12 @@ broadcast_internal(Msg, State = #state { self          = Self,
 %% ---------------------------------------------------------------------------
 
 with_member(Fun, Id, MembersState) ->
-    maybe_store_member(
+    store_member(
       Id, Fun(find_member_or_blank(Id, MembersState)), MembersState).
 
 with_member_acc(Fun, Id, {MembersState, Acc}) ->
     {MemberState, Acc1} = Fun(find_member_or_blank(Id, MembersState), Acc),
-    {maybe_store_member(Id, MemberState, MembersState), Acc1}.
+    {store_member(Id, MemberState, MembersState), Acc1}.
 
 find_member_or_blank(Id, MembersState) ->
     case dict:find(Id, MembersState) of
@@ -603,20 +621,17 @@ find_member_or_blank(Id, MembersState) ->
         error        -> blank_member()
     end.
 
+erase_member(Id, MembersState) ->
+    dict:erase(Id, MembersState).
+
 blank_member() ->
     queue:new().
 
 blank_member_state() ->
     dict:new().
 
-is_member_empty(Member) ->
-    queue:is_empty(Member).
-
-maybe_store_member(Id, Member, MembersState) ->
-    case is_member_empty(Member) of
-        true  -> dict:erase(Id, MembersState);
-        false -> dict:store(Id, Member, MembersState)
-    end.
+store_member(Id, Member, MembersState) ->
+    dict:store(Id, Member, MembersState).
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
