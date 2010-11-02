@@ -195,6 +195,8 @@
           myselves
         }).
 
+-record(member, { pending_acks, hop_count }).
+
 -record(gm_group, { name, members }).
 
 -define(TAG, '$gm').
@@ -307,8 +309,8 @@ handle_cast(join, State = #state { self          = Self,
       callback(
         Callback,
         dict:fold(
-          fun (Id, PendingAcks, MsgsAcc) ->
-                  output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
+          fun (Id, #member { pending_acks = PA, hop_count = HC }, MsgsAcc) ->
+                  output_cons(MsgsAcc, Id, HC + 1, queue:to_list(PA), [])
           end, [], MembersState), State2));
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
@@ -323,31 +325,48 @@ handle_cast({catch_up, Left, MembersStateLeft},
                              myselves      = Myselves }) ->
     AllMembers = lists:usort(dict:fetch_keys(MembersState) ++
                                  dict:fetch_keys(MembersStateLeft)),
-    {MembersState1, Outbound} =
+    {MembersState1, {Myselves1, Outbound}} =
         lists:foldl(
-          fun (Id, MembersStateOutbound) ->
-                  PALeft = find_member_or_blank(Id, MembersStateLeft),
+          fun (Id, MembersStateMyselvesOutbound) ->
+                  #member { pending_acks = PALeft,
+                            hop_count = HCLeft } = MemberLeft =
+                      find_member_or_blank(Id, MembersStateLeft),
                   with_member_acc(
-                    fun (PA, Outbound1) ->
-                            case sets:is_element(Id, Myselves) of
+                    fun (Member = #member { pending_acks = PA },
+                         {Myselves2, Outbound1}) ->
+                            Myselves3 = maybe_inherit(Id, MemberLeft, Member,
+                                                      Myselves2),
+                            case is_mine(Id, Myselves3) of
                                 true ->
+                                    case Id =/= Self of
+                                        true -> io:format("~p inherits ~p~n", [Self, Id]);
+                                        false -> ok
+                                    end,
                                     {_AcksInFlight, Pubs, PA1} =
                                         find_prefix_common_suffix(PALeft, PA),
-                                    {PA1, output_cons(Outbound1, Id, [],
-                                                      acks_from_queue(Pubs))};
+                                    {Member #member { pending_acks = PA1,
+                                                      hop_count = 0 },
+                                     {Myselves3,
+                                      output_cons(Outbound1, Id, 0, [],
+                                                  acks_from_queue(Pubs))}};
                                 false ->
                                     {Acks, Common, Pubs} =
                                         find_prefix_common_suffix(PA, PALeft),
-                                    {join_pubs(Common, queue:to_list(Pubs)),
-                                     output_cons(Outbound1, Id,
-                                                 queue:to_list(Pubs),
-                                                 acks_from_queue(Acks))}
+                                    PA1 = join_pubs(
+                                            Common, queue:to_list(Pubs)),
+                                    {Member #member { pending_acks = PA1,
+                                                      hop_count = HCLeft + 1 },
+                                     {Myselves3,
+                                      output_cons(Outbound1, Id, HCLeft + 1,
+                                                  queue:to_list(Pubs),
+                                                  acks_from_queue(Acks))}}
                             end
-                    end, Id, MembersStateOutbound)
-          end, {MembersState, []}, AllMembers),
+                    end, Id, MembersStateMyselvesOutbound)
+          end, {MembersState, {Myselves, []}}, AllMembers),
     send_right(Self, Outbound, Right),
     noreply(callback(Callback, Outbound,
-                     State #state { members_state = MembersState1 }));
+                     State #state { members_state = MembersState1,
+                                    myselves      = Myselves1 }));
 
 handle_cast({catch_up, _Left, _MembersStateLeft}, State) ->
     noreply(State).
@@ -376,16 +395,20 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                  {Self, undefined} ->
                      State1 #state { members_state = blank_member_state() };
                  {Neighbour, _MRef} ->
+                     io:format("~p ~p sending catchup to ~p:~n~p~n",
+                               [now(), Self, Neighbour, dict:to_list(MembersState)]),
                      ok = gen_server2:cast(
                             Neighbour, {catch_up, Self, MembersState}),
                      State1
              end,
     noreply(case Left of %% original left
-                {Member, _MRef2} -> Msg = {?TAG, {member_left, Member}},
-                                    callback(Callback,
-                                             [{Self, [{undefined, Msg}], []}],
-                                             broadcast_internal(Msg, State2));
-                _                -> State2
+                {Member, _MRef2} ->
+                    Msg = {?TAG, {member_left, Member}},
+                    callback(Callback,
+                             [{Self, 0, [{undefined, Msg}], []}],
+                             broadcast_internal(Msg, State2));
+                _ ->
+                    State2
             end).
 
 terminate(normal, _State) ->
@@ -494,7 +517,11 @@ join_group_internal(Self, #gm_group { name = GroupName, members = Members }) ->
         case gen_server2:call(
                MostRecentlyAdded, {add_new_member, Self}, infinity) of
             {ok, Group, MembersState} ->
-                {Group, MembersState};
+                MembersState1 =
+                    dict:map(fun (_Id, Member = #member { hop_count = HC }) ->
+                                     Member #member { hop_count = HC + 1 }
+                             end, MembersState),
+                {Group, MembersState1};
             not_most_recently_added ->
                 join_group_internal(Self, read_group(GroupName))
         end
@@ -516,7 +543,7 @@ check_neighbours(Group = #gm_group {}, State = #state { self  = Self,
     {Left1, Right1} = find_neighbours(Group, Self),
     Left2 = ensure_neighbour(Self, Left, Left1),
     Right2 = ensure_neighbour(Self, Right, Right1),
-    io:format(".. ~p ==> ~p ==> ~p ..~n", [Left1, Self, Right1]),
+    io:format("~p >--> ~p >--> ~p~n", [Left1, Self, Right1]),
     State #state { left = Left2, right = Right2 }.
 
 %% ---------------------------------------------------------------------------
@@ -553,14 +580,32 @@ find_common(A, B, Common) ->
             {Common, B}
     end.
 
+maybe_inherit(Id, #member { hop_count = undefined },
+                  #member { hop_count = HC }, Selves) when HC =/= undefined ->
+    sets:add_element(Id, Selves);
+maybe_inherit(_Id, #member { hop_count = HCLeft },
+                   #member { hop_count = undefined }, Selves)
+  when HCLeft =/= undefined ->
+    Selves;
+maybe_inherit(Id, #member { hop_count = HCLeft },
+                  #member { hop_count = HC }, Selves)
+  when HCLeft =/= undefined andalso HC =/= undefined ->
+    case HCLeft > HC of
+        true  -> sets:add_element(Id, Selves);
+        false -> Selves
+    end.
+
+is_mine(Id, Selves) ->
+    sets:is_element(Id, Selves).
+
 %% ---------------------------------------------------------------------------
 %% Sending
 %% ---------------------------------------------------------------------------
 
-output_cons(Outbound, _Id, [], []) ->
+output_cons(Outbound, _Id, _HC, [], []) ->
     Outbound;
-output_cons(Outbound, Id, Pubs, Acks) ->
-    [{Id, Pubs, Acks} | Outbound].
+output_cons(Outbound, Id, HC, Pubs, Acks) ->
+    [{Id, HC, Pubs, Acks} | Outbound].
 
 send_right(Self, _Msg, {Self, undefined}) ->
     false;
@@ -572,9 +617,9 @@ send_right(Self, Msg, {Right, _MRef}) ->
 
 callback(Callback, Msgs, State) ->
     lists:foldl(
-      fun ({Id, Pubs, _Acks}, State1) ->
+      fun ({Id, _HC, Pubs, _Acks}, State1) ->
               lists:foldl(
-                fun ({_PubNum, {?TAG, {member_left, Member} = Pub}},
+                fun ({_PubNum, {?TAG, {member_left_, Member} = Pub}},
                      State2 = #state { members_state = MembersState }) ->
                         Callback(Id, Pub),
                         State2 #state { members_state =
@@ -594,12 +639,17 @@ broadcast_internal(Msg, State = #state { self          = Self,
                                          members_state = MembersState,
                                          pub_count     = PubCount }) ->
     PubMsg = {PubCount, Msg},
-    Outbound = [{Self, [PubMsg], []}],
+    Outbound = [{Self, 0, [PubMsg], []}],
     MembersState1 =
         case send_right(Self, Outbound, Right) of
-            true  -> with_member(fun (PA) -> queue:in(PubMsg, PA) end,
-                                 Self, MembersState);
-            false -> MembersState
+            true ->
+                with_member(
+                  fun (Member = #member { pending_acks = PA }) ->
+                          Member #member { pending_acks = queue:in(PubMsg, PA),
+                                           hop_count = 0 }
+                  end, Self, MembersState);
+            false ->
+                MembersState
         end,
     State #state { members_state = MembersState1, pub_count = PubCount + 1 }.
 
@@ -625,7 +675,8 @@ erase_member(Id, MembersState) ->
     dict:erase(Id, MembersState).
 
 blank_member() ->
-    queue:new().
+    #member { pending_acks = queue:new(),
+              hop_count    = undefined }.
 
 blank_member_state() ->
     dict:new().
@@ -647,28 +698,40 @@ apply_acks([PubNum | Acks], Pubs) ->
     apply_acks(Acks, Pubs1).
 
 process_activity_fun(Myselves) ->
-    fun ({Id, Pubs, Acks} = Msg, MembersStateOutbound) ->
+    fun ({Id, HC, Pubs, Acks}, MembersStateOutbound) ->
             with_member_acc(
-              fun (PA, Outbound1) ->
-                      case sets:is_element(Id, Myselves) of
+              fun (Member = #member { pending_acks = PA }, Outbound1) ->
+                      case is_mine(Id, Myselves) of
                           true ->
+                              case Id =/= self() of
+                                  true -> io:format("~p owns ~p~n", [self(), Id]);
+                                  false -> ok
+                              end,
                               {ToAck, PA1} = find_common(queue:from_list(Pubs),
                                                          PA, queue:new()),
-                              {PA1, output_cons(Outbound1, Id, [],
-                                                acks_from_queue(ToAck))};
+                              {Member #member { pending_acks = PA1,
+                                                hop_count = 0 },
+                               output_cons(Outbound1, Id, 0, [],
+                                           acks_from_queue(ToAck))};
                           false ->
-                              PA1 = join_pubs(PA, Pubs),
-                              {apply_acks(Acks, PA1), [Msg | Outbound1]}
+                              PA1 = apply_acks(Acks, join_pubs(PA, Pubs)),
+                              {Member #member { pending_acks = PA1,
+                                                hop_count = HC + 1 },
+                               [{Id, HC + 1, Pubs, Acks} | Outbound1]}
                       end
               end, Id, MembersStateOutbound)
     end.
 
+%% TODO: when everything's right, this should just be queue:join/2
 join_pubs(Q, []) ->
     Q;
-join_pubs(Q, [{Num, _} = Pub | Pubs]) ->
+join_pubs(Q, [{Num, _} = Pub | Pubs] = AllPubs) ->
     case queue:out_r(Q) of
         {empty, _Q} ->
             join_pubs(queue:in(Pub, Q), Pubs);
         {{value, {Num1, _}}, _Q} when Num1 + 1 =:= Num ->
-            join_pubs(queue:in(Pub, Q), Pubs)
+            join_pubs(queue:in(Pub, Q), Pubs);
+        {{value, {_Num1, _}}, _Q} ->
+            io:format("~p join_pubs(~p, ~p)~n", [self(), queue:to_list(Q), AllPubs]),
+            exit(join_pubs_failure)
     end.
