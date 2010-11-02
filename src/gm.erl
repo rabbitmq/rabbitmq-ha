@@ -175,21 +175,21 @@
 
 -behaviour(gen_server2).
 
--export([create_table/0, join/2, leave/1, broadcast/2]).
+-export([create_tables/0, join/2, leave/1, broadcast/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--define(TABLE, gm_group).
+-define(GROUP_TABLE, gm_group).
 -define(HIBERNATE_AFTER_MIN, 1000).
 -define(DESIRED_HIBERNATE, 10000).
 
 -record(state,
         { self,
-          upstream,
-          downstream,
+          left,
+          right,
           group_name,
-          members,
+          members_state,
           callback,
           pub_count,
           myselves
@@ -197,12 +197,20 @@
 
 -record(gm_group, { name, members }).
 
-create_table() ->
-    case mnesia:create_table(
-           ?TABLE, [{record_name, gm_group},
-                    {attributes, record_info(fields, gm_group)}]) of
-        {atomic, ok}                          -> ok;
-        {aborted, {already_exists, gm_group}} -> ok;
+-define(TABLES,
+        [{?GROUP_TABLE, [{record_name, gm_group},
+                         {attributes, record_info(fields, gm_group)}]}
+        ]).
+
+create_tables() ->
+    create_tables(?TABLES).
+
+create_tables([]) ->
+    ok;
+create_tables([{Table, Attributes} | Tables]) ->
+    case mnesia:create_table(Table, Attributes) of
+        {atomic, ok}                          -> create_tables(Tables);
+        {aborted, {already_exists, gm_group}} -> create_tables(Tables);
         Err                                   -> Err
     end.
 
@@ -216,33 +224,35 @@ broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
 
 init([GroupName, Callback]) ->
+    process_flag(trap_exit, true),
     gen_server2:cast(self(), join),
     Self = self(),
-    {ok, #state { self        = Self,
-                  upstream    = undefined,
-                  downstream  = undefined,
-                  group_name  = GroupName,
-                  members     = undefined,
-                  callback    = Callback,
-                  pub_count   = 0,
-                  myselves    = sets:add_element(Self, sets:new()) }, hibernate,
+    {ok, #state { self          = Self,
+                  left          = undefined,
+                  right         = undefined,
+                  group_name    = GroupName,
+                  members_state = undefined,
+                  callback      = Callback,
+                  pub_count     = 0,
+                  myselves      = sets:add_element(Self, sets:new()) },
+     hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 handle_call({add_new_member, Member}, _From,
-            State = #state { self       = Self,
-                             group_name = GroupName,
-                             members    = Members }) ->
+            State = #state { self          = Self,
+                             group_name    = GroupName,
+                             members_state = MembersState }) ->
     {atomic, Result} =
         mnesia:sync_transaction(
           fun () ->
-                  [Group = #gm_group { members = Members1 }] =
-                      mnesia:read(?TABLE, GroupName),
-                  Q = queue:from_list(Members1),
+                  [Group = #gm_group { members = Members }] =
+                      mnesia:read(?GROUP_TABLE, GroupName),
+                  Q = queue:from_list(Members),
                   case queue:out_r(Q) of
                       {{value, Self}, _Q1} ->
-                          Q1 = queue:to_list(queue:in(Member, Q)),
-                          Group1 = Group #gm_group { members = Q1 },
-                          ok = mnesia:write(Group1),
+                          Members1 = queue:to_list(queue:in(Member, Q)),
+                          Group1 = Group #gm_group { members = Members1 },
+                          mnesia:write(Group1),
                           {ok, Group1};
                       {{value, _Member}, _Q1} ->
                           not_most_recently_added
@@ -250,24 +260,26 @@ handle_call({add_new_member, Member}, _From,
           end),
     case Result of
         {ok, Group2} ->
-            reply({ok, Group2, Members}, check_neighbours(Group2, State));
+            reply({ok, Group2, MembersState}, check_neighbours(Group2, State));
         not_most_recently_added ->
             reply(not_most_recently_added, State)
     end.
 
-handle_cast({activity, Up, Msgs}, State = #state { self       = Self,
-                                                   upstream   = {Up, _MRef},
-                                                   downstream = Down,
-                                                   members    = Members,
-                                                   callback   = Callback,
-                                                   myselves   = Myselves }) ->
+handle_cast({activity, Left, Msgs},
+            State = #state { self          = Self,
+                             left          = {Left, _MRef},
+                             right         = Right,
+                             members_state = MembersState,
+                             callback      = Callback,
+                             myselves      = Myselves }) ->
     ActivityFun = process_activity_fun(Myselves),
-    {Members1, Outbound} = lists:foldl(ActivityFun, {Members, []}, Msgs),
-    ok = send_downstream(Self, Outbound, Down),
+    {MembersState1, Outbound} =
+        lists:foldl(ActivityFun, {MembersState, []}, Msgs),
+    send_right(Self, Outbound, Right),
     ok = callback(Callback, Outbound),
-    noreply(State #state { members = Members1 });
+    noreply(State #state { members_state = MembersState1 });
 
-handle_cast({activity, _Up, _Msgs}, State) ->
+handle_cast({activity, _Left, _Msgs}, State) ->
     noreply(State);
 
 handle_cast({broadcast, Msg}, State) ->
@@ -276,122 +288,107 @@ handle_cast({broadcast, Msg}, State) ->
 handle_cast(leave, State) ->
     {stop, normal, State};
 
-handle_cast(join, State = #state { self       = Self,
-                                   upstream   = undefined,
-                                   downstream = undefined,
-                                   group_name = GroupName,
-                                   members    = undefined,
-                                   callback   = Callback }) ->
-    {Group, Members} =
-        case maybe_create_group(GroupName, Self) of
-            {new, Group1}      -> {Group1, dict:new()};
-            {existing, Group1} -> join_group_internal(Self, Group1)
-        end,
-    {Up, Down} = find_neighbours(Group, Self),
-    State1 = State #state { upstream   = {Up, maybe_monitor(Up, Self)},
-                            downstream = {Down, maybe_monitor(Down, Self)},
-                            members    = Members },
-    State2 = broadcast_internal({member_joined, GroupName, Self}, State1),
+handle_cast(join, State = #state { self          = Self,
+                                   left          = undefined,
+                                   right         = undefined,
+                                   group_name    = GroupName,
+                                   members_state = undefined,
+                                   callback      = Callback }) ->
+    {Group, MembersState} =
+        join_group_internal(Self, maybe_create_group(GroupName, Self)),
+    {Left, Right} = find_neighbours(Group, Self),
+    State1 = State #state { left          = {Left, maybe_monitor(Left, Self)},
+                            right         = {Right, maybe_monitor(Right, Self)},
+                            members_state = MembersState },
+    State2 = broadcast_internal({member_joined, Self}, State1),
     ok = callback(
            Callback,
            dict:fold(
              fun (Id, PendingAcks, MsgsAcc) ->
                      output_cons(MsgsAcc, Id, queue:to_list(PendingAcks), [])
-             end, [], Members)),
+             end, [], MembersState)),
     noreply(State2);
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
-    {ok, Group} = read_group(GroupName),
-    noreply(check_neighbours(Group, State));
+    noreply(check_neighbours(read_group(GroupName), State));
 
-handle_cast({catch_up, Up, MembersUp},
-            State = #state { self       = Self,
-                             upstream   = {Up, _MRef},
-                             downstream = Down,
-                             members    = Members,
-                             callback   = Callback,
-                             myselves   = Myselves }) ->
-    AllMembers = lists:usort(
-                   dict:fetch_keys(Members) ++ dict:fetch_keys(MembersUp)),
-    {Members1, Outbound} =
+handle_cast({catch_up, Left, MembersStateLeft},
+            State = #state { self          = Self,
+                             left          = {Left, _MRef},
+                             right         = Right,
+                             members_state = MembersState,
+                             callback      = Callback,
+                             myselves      = Myselves }) ->
+    AllMembers = lists:usort(dict:fetch_keys(MembersState) ++
+                                 dict:fetch_keys(MembersStateLeft)),
+    {MembersState1, Outbound} =
         lists:foldl(
-          fun (Id, MembersOutbound) ->
-                  PAUp = find_member_or_blank(Id, MembersUp),
+          fun (Id, MembersStateOutbound) ->
+                  PALeft = find_member_or_blank(Id, MembersStateLeft),
                   with_member_acc(
                     fun (PA, Outbound1) ->
                             case sets:is_element(Id, Myselves) of
                                 true ->
                                     {_AcksInFlight, Pubs, PA1} =
-                                        find_prefix_common_suffix(PAUp, PA),
+                                        find_prefix_common_suffix(PALeft, PA),
                                     {PA1, output_cons(Outbound1, Id, [],
                                                       acks_from_queue(Pubs))};
                                 false ->
                                     {Acks, Common, Pubs} =
-                                        find_prefix_common_suffix(PA, PAUp),
-                                    {queue:join(Common, Pubs),
+                                        find_prefix_common_suffix(PA, PALeft),
+                                    {join_pubs(Common, queue:to_list(Pubs)),
                                      output_cons(Outbound1, Id,
                                                  queue:to_list(Pubs),
                                                  acks_from_queue(Acks))}
                             end
-                    end, Id, MembersOutbound)
-          end, {Members, []}, AllMembers),
-    ok = send_downstream(Self, Outbound, Down),
+                    end, Id, MembersStateOutbound)
+          end, {MembersState, []}, AllMembers),
+    send_right(Self, Outbound, Right),
     ok = callback(Callback, Outbound),
-    noreply(State #state { members = Members1 });
+    noreply(State #state { members_state = MembersState1 });
 
-handle_cast({catch_up, _Up, _MembersUp}, State) ->
+handle_cast({catch_up, _Left, _MembersStateLeft}, State) ->
     noreply(State).
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { self       = Self,
-                             upstream   = Up,
-                             downstream = Down,
-                             group_name = GroupName,
-                             members    = Members,
-                             myselves   = Myselves,
-                             callback   = Callback }) ->
-    {Member, State1} =
-        case {Up, Down} of
-            {{Member1, MRef}, _} ->
-                Msg = {member_left, Member1},
-                Callback(Self, Msg),
-                Myselves1 = sets:add_element(Member1, Myselves),
-                {Member1, broadcast_internal(Msg, State #state { myselves = Myselves1 })};
-            {_, {Member1, MRef}} ->
-                {Member1, State};
-            _ ->
-                {unknown, State}
-        end,
-    {ok, Group} =
+            State = #state { self          = Self,
+                             left          = Left,
+                             right         = Right,
+                             group_name    = GroupName,
+                             members_state = MembersState,
+                             callback      = Callback }) ->
+    Member = case {Left, Right} of
+                 {{Member1, MRef}, _} -> Member1;
+                 {_, {Member1, MRef}} -> Member1;
+                 _                    -> unknown
+             end,
+    Group = #gm_group {} =
         case Member of
-            unknown ->
-                read_group(GroupName);
-            _ ->
-                {atomic, Group1} =
-                    mnesia:sync_transaction(
-                      fun () ->
-                              [Group2 = #gm_group { members = Members1 }] =
-                                  mnesia:read(?TABLE, GroupName),
-                              case lists:delete(Member, Members1) of
-                                  Members1 -> Group2;
-                                  Members2 -> Group3 = Group2 #gm_group {
-                                                         members = Members2 },
-                                              mnesia:write(Group3),
-                                              Group3
-                              end
-                      end),
-                {ok, Group1}
+            unknown -> read_group(GroupName);
+            _       -> delete_member_from_group(Member, GroupName)
         end,
-    State2 = #state { downstream = Down1 } = check_neighbours(Group, State1),
-    ok = case Down1 of
-             Down               -> ok;
-             {Self, undefined}  -> ok;
-             {Neighbour, _MRef} -> gen_server2:cast(Neighbour,
-                                                    {catch_up, Self, Members})
-         end,
-    noreply(State2).
+    State1 = #state { right = Right1 } = check_neighbours(Group, State),
+    State2 = case Right1 of
+                 Right ->
+                     State1;
+                 {Self, undefined} ->
+                     State1 #state { members_state = blank_member_state() };
+                 {Neighbour, _MRef} ->
+                     ok = gen_server2:cast(
+                            Neighbour, {catch_up, Self, MembersState}),
+                     State1
+             end,
+    noreply(case Left of %% original left
+                {Member, _MRef2} -> Msg = {member_left, Member},
+                                    Callback(Self, Msg),
+                                    broadcast_internal(Msg, State2);
+                _                -> State2
+            end).
 
-terminate(_Reason, _State) ->
+terminate(normal, _State) ->
+    ok;
+terminate(Reason, State) ->
+    io:format("~p died~nreason: ~p~nstate: ~p~n", [self(), Reason, State]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -413,38 +410,39 @@ find_neighbours(#gm_group { members = Members }, Self) ->
 find_neighbours1(Q, Self) ->
     case queue:out(Q) of
         {{value, Self}, Q1} ->
-            {{value, Up}, _Q2} = queue:out_r(Q),
-            {{value, Down}, _Q3} = queue:out(queue:in(Self, Q1)),
-            {Up, Down};
+            {{value, Left}, _Q2} = queue:out_r(Q),
+            {{value, Right}, _Q3} = queue:out(queue:in(Self, Q1)),
+            {Left, Right};
         {{value, Other}, Q1} ->
             find_neighbours1(queue:in(Other, Q1), Self)
     end.
 
 read_group(GroupName) ->
-    case mnesia:dirty_read(?TABLE, GroupName) of
+    case mnesia:dirty_read(?GROUP_TABLE, GroupName) of
         []      -> {error, not_found};
-        [Group] -> {ok, Group}
+        [Group] -> Group
     end.
 
 maybe_create_group(GroupName, Self) ->
     case read_group(GroupName) of
-        {error, not_found} ->
-            {atomic, Result} =
+        Group = #gm_group { members = [_|_] } ->
+            Group;
+        Case when Case =:= {error, not_found} orelse
+                  Case #gm_group.members =:= [] ->
+            {atomic, Group} =
                 mnesia:sync_transaction(
                   fun () ->
-                          case mnesia:read(?TABLE, GroupName) of
-                              [] ->
-                                  Group = #gm_group{ name = GroupName,
-                                                     members = [Self] },
-                                  ok = mnesia:write(Group),
-                                  {new, Group};
-                              [Group] ->
-                                  {existing, Group}
+                          case mnesia:read(?GROUP_TABLE, GroupName) of
+                              [Group1 = #gm_group { members = [_|_] }] ->
+                                  Group1;
+                              _ ->
+                                  Group1 = #gm_group { name    = GroupName,
+                                                       members = [Self] },
+                                  mnesia:write(Group1),
+                                  Group1
                           end
                   end),
-            Result;
-        {ok, Group} ->
-            {existing, Group}
+            Group
     end.
 
 maybe_monitor(Self, Self) ->
@@ -468,22 +466,55 @@ ensure_neighbour(Self, {RealNeighbour, MRef}, Neighbour) ->
                 {Neighbour, maybe_monitor(Neighbour, Self)}
     end.
 
+delete_member_from_group(Member, GroupName) ->
+    {atomic, Group} =
+        mnesia:sync_transaction(
+          fun () -> [Group = #gm_group { members = Members }] =
+                        mnesia:read(?GROUP_TABLE, GroupName),
+                    case lists:delete(Member, Members) of
+                        Members  -> Group;
+                        Members1 -> Group1 =
+                                        Group #gm_group { members = Members1 },
+                                    mnesia:write(Group1),
+                                    Group1
+                    end
+          end),
+    Group.
+
+join_group_internal(Self, #gm_group { members = [], name = GroupName }) ->
+    join_group_internal(Self, maybe_create_group(GroupName, Self));
+join_group_internal(Self, #gm_group { members = [Self] } = Group) ->
+    {Group, blank_member_state()};
 join_group_internal(Self, #gm_group { name = GroupName, members = Members }) ->
     [MostRecentlyAdded | _] = lists:reverse(Members),
-    case gen_server2:call(
-           MostRecentlyAdded, {add_new_member, Self}, infinity) of
-        {ok, Group, Members1}   -> {Group, Members1};
-        not_most_recently_added -> {ok, Group} = read_group(GroupName),
-                                   join_group_internal(Self, Group)
+    try
+        case gen_server2:call(
+               MostRecentlyAdded, {add_new_member, Self}, infinity) of
+            {ok, Group, MembersState} ->
+                {Group, MembersState};
+            not_most_recently_added ->
+                join_group_internal(Self, read_group(GroupName))
+        end
+    catch
+        exit:{noproc, _} ->
+            Group1 = #gm_group {} =
+                case Members of
+                    [MostRecentlyAdded] ->
+                        delete_member_from_group(MostRecentlyAdded, GroupName);
+                    _ ->
+                        read_group(GroupName)
+                end,
+            join_group_internal(Self, Group1)
     end.
 
-check_neighbours(Group, State = #state { self       = Self,
-                                         upstream   = Up,
-                                         downstream = Down }) ->
-    {Up1, Down1} = find_neighbours(Group, Self),
-    Up2 = ensure_neighbour(Self, Up, Up1),
-    Down2 = ensure_neighbour(Self, Down, Down1),
-    State #state { upstream = Up2, downstream = Down2 }.
+check_neighbours(Group = #gm_group {}, State = #state { self  = Self,
+                                                        left  = Left,
+                                                        right = Right }) ->
+    {Left1, Right1} = find_neighbours(Group, Self),
+    Left2 = ensure_neighbour(Self, Left, Left1),
+    Right2 = ensure_neighbour(Self, Right, Right1),
+    io:format("~p {~p, ~p}~n", [Self, Left1, Right1]),
+    State #state { left = Left2, right = Right2 }.
 
 %% ---------------------------------------------------------------------------
 %% Catchup delta detection
@@ -528,40 +559,46 @@ output_cons(Outbound, _Id, [], []) ->
 output_cons(Outbound, Id, Pubs, Acks) ->
     [{Id, Pubs, Acks} | Outbound].
 
-send_downstream(Self, _Msg, {Self, undefined}) ->
-    ok;
-send_downstream(_Self, [], _Down) ->
-    ok;
-send_downstream(Self, Msg, {Down, _MRef}) ->
-    gen_server2:cast(Down, {activity, Self, Msg}).
+send_right(Self, _Msg, {Self, undefined}) ->
+    false;
+send_right(_Self, [], _Right) ->
+    false;
+send_right(Self, Msg, {Right, _MRef}) ->
+    ok = gen_server2:cast(Right, {activity, Self, Msg}),
+    true.
 
 callback(Callback, Msgs) ->
     [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Msgs, {_PubNum, Pub} <- Pubs],
     ok.
 
-broadcast_internal(Msg, State = #state { self       = Self,
-                                         downstream = Down,
-                                         members    = Members,
-                                         pub_count  = PubCount }) ->
+broadcast_internal(Msg, State = #state { self          = Self,
+                                         right         = Right,
+                                         members_state = MembersState,
+                                         pub_count     = PubCount }) ->
     PubMsg = {PubCount, Msg},
     Outbound = [{Self, [PubMsg], []}],
-    ok = send_downstream(Self, Outbound, Down),
-    Members1 = with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, Members),
-    State #state { members = Members1, pub_count = PubCount + 1 }.
+    MembersState1 =
+        case send_right(Self, Outbound, Right) of
+            true  -> with_member(fun (PA) -> queue:in(PubMsg, PA) end,
+                                 Self, MembersState);
+            false -> MembersState
+        end,
+    State #state { members_state = MembersState1, pub_count = PubCount + 1 }.
 
 %% ---------------------------------------------------------------------------
 %% Members helpers
 %% ---------------------------------------------------------------------------
 
-with_member(Fun, Id, Members) ->
-    maybe_store_member(Id, Fun(find_member_or_blank(Id, Members)), Members).
+with_member(Fun, Id, MembersState) ->
+    maybe_store_member(
+      Id, Fun(find_member_or_blank(Id, MembersState)), MembersState).
 
-with_member_acc(Fun, Id, {Members, Acc}) ->
-    {Member1, Acc1} = Fun(find_member_or_blank(Id, Members), Acc),
-    {maybe_store_member(Id, Member1, Members), Acc1}.
+with_member_acc(Fun, Id, {MembersState, Acc}) ->
+    {MemberState, Acc1} = Fun(find_member_or_blank(Id, MembersState), Acc),
+    {maybe_store_member(Id, MemberState, MembersState), Acc1}.
 
-find_member_or_blank(Id, Members) ->
-    case dict:find(Id, Members) of
+find_member_or_blank(Id, MembersState) ->
+    case dict:find(Id, MembersState) of
         {ok, Result} -> Result;
         error        -> blank_member()
     end.
@@ -569,13 +606,16 @@ find_member_or_blank(Id, Members) ->
 blank_member() ->
     queue:new().
 
+blank_member_state() ->
+    dict:new().
+
 is_member_empty(Member) ->
     queue:is_empty(Member).
 
-maybe_store_member(Id, Member, Members) ->
+maybe_store_member(Id, Member, MembersState) ->
     case is_member_empty(Member) of
-        true  -> dict:erase(Id, Members);
-        false -> dict:store(Id, Member, Members)
+        true  -> dict:erase(Id, MembersState);
+        false -> dict:store(Id, Member, MembersState)
     end.
 
 %% ---------------------------------------------------------------------------
@@ -592,7 +632,7 @@ apply_acks([PubNum | Acks], Pubs) ->
     apply_acks(Acks, Pubs1).
 
 process_activity_fun(Myselves) ->
-    fun ({Id, Pubs, Acks} = Msg, MembersOutbound) ->
+    fun ({Id, Pubs, Acks} = Msg, MembersStateOutbound) ->
             with_member_acc(
               fun (PA, Outbound1) ->
                       case sets:is_element(Id, Myselves) of
@@ -602,8 +642,18 @@ process_activity_fun(Myselves) ->
                               {PA1, output_cons(Outbound1, Id, [],
                                                 acks_from_queue(ToAck))};
                           false ->
-                              PA1 = queue:join(PA, queue:from_list(Pubs)),
+                              PA1 = join_pubs(PA, Pubs),
                               {apply_acks(Acks, PA1), [Msg | Outbound1]}
                       end
-              end, Id, MembersOutbound)
+              end, Id, MembersStateOutbound)
+    end.
+
+join_pubs(Q, []) ->
+    Q;
+join_pubs(Q, [{Num, _} = Pub | Pubs]) ->
+    case queue:out_r(Q) of
+        {empty, _Q} ->
+            join_pubs(queue:in(Pub, Q), Pubs);
+        {{value, {Num1, _}}, _Q} when Num1 + 1 =:= Num ->
+            join_pubs(queue:in(Pub, Q), Pubs)
     end.
