@@ -300,10 +300,13 @@ handle_cast(join, State = #state { self          = Self,
                                    callback      = Callback }) ->
     {Group, MembersState} =
         join_group_internal(Self, maybe_create_group(GroupName, Self)),
+    MembersState1 = store_member(Self,
+                                 (blank_member()) #member { hop_count = 0 },
+                                 MembersState),
     {Left, Right} = find_neighbours(Group, Self),
     State1 = State #state { left          = {Left, maybe_monitor(Left, Self)},
                             right         = {Right, maybe_monitor(Right, Self)},
-                            members_state = MembersState },
+                            members_state = MembersState1 },
     State2 = broadcast_internal({?TAG, {member_joined, Self}},
                                 maybe_send_catchup(undefined, State1)),
     noreply(
@@ -340,7 +343,8 @@ handle_cast({catch_up, Left, MembersStateLeft},
                             case is_mine(Id, Myselves3) of
                                 true ->
                                     case Id =/= Self of
-                                        true -> io:format("~p inherits ~p~n", [Self, Id]);
+                                        true -> io:format("~p inherits ~p ~p~n",
+                                                          [Self, Id, {MemberLeft, Member}]);
                                         false -> ok
                                     end,
                                     {_AcksInFlight, Pubs, PA1} =
@@ -605,14 +609,20 @@ send_right(Self, Msg, {Right, _MRef}) ->
 
 callback(Callback, Msgs, State) ->
     lists:foldl(
-      fun ({Id, _HC, Pubs, _Acks}, State1) ->
+      fun ({Id, HC, Pubs, _Acks}, State1) ->
               lists:foldl(
-                fun ({_PubNum, {?TAG, {member_left_, Member} = Pub}},
+                fun ({_PubNum, {?TAG, {member_joined, _Member} = Pub}},
                      State2 = #state { members_state = MembersState }) ->
                         Callback(Id, Pub),
-                        State2 #state { members_state =
-                                            erase_member(Member,
-                                                         MembersState) };
+                        MembersState1 =
+                            dict:map(
+                              fun (_Id, Member1 = #member { hop_count = HC1 })
+                                  when HC1 > HC ->
+                                      Member1 #member { hop_count = HC1 + 1 };
+                                  (_Id, Member1) ->
+                                       Member1
+                              end, MembersState),
+                        State2 #state { members_state = MembersState1 };
                     ({_PubNum, {?TAG, Pub}}, State2) ->
                         Callback(Id, Pub),
                         State2;
