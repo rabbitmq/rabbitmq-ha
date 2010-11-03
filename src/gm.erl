@@ -304,13 +304,14 @@ handle_cast(join, State = #state { self          = Self,
     State1 = State #state { left          = {Left, maybe_monitor(Left, Self)},
                             right         = {Right, maybe_monitor(Right, Self)},
                             members_state = MembersState },
-    State2 = broadcast_internal({?TAG, {member_joined, Self}}, State1),
+    State2 = broadcast_internal({?TAG, {member_joined, Self}},
+                                maybe_send_catchup(undefined, State1)),
     noreply(
       callback(
         Callback,
         dict:fold(
           fun (Id, #member { pending_acks = PA, hop_count = HC }, MsgsAcc) ->
-                  output_cons(MsgsAcc, Id, HC + 1, queue:to_list(PA), [])
+                  output_cons(MsgsAcc, Id, HC, queue:to_list(PA), [])
           end, [], MembersState), State2));
 
 handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
@@ -372,12 +373,11 @@ handle_cast({catch_up, _Left, _MembersStateLeft}, State) ->
     noreply(State).
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { self          = Self,
-                             left          = Left,
-                             right         = Right,
-                             group_name    = GroupName,
-                             members_state = MembersState,
-                             callback      = Callback }) ->
+            State = #state { self       = Self,
+                             left       = Left,
+                             right      = Right,
+                             group_name = GroupName,
+                             callback   = Callback }) ->
     Member = case {Left, Right} of
                  {{Member1, MRef}, _} -> Member1;
                  {_, {Member1, MRef}} -> Member1;
@@ -388,27 +388,15 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
             unknown -> read_group(GroupName);
             _       -> delete_member_from_group(Member, GroupName)
         end,
-    State1 = #state { right = Right1 } = check_neighbours(Group, State),
-    State2 = case Right1 of
-                 Right ->
-                     State1;
-                 {Self, undefined} ->
-                     State1 #state { members_state = blank_member_state() };
-                 {Neighbour, _MRef} ->
-                     io:format("~p ~p sending catchup to ~p:~n~p~n",
-                               [now(), Self, Neighbour, dict:to_list(MembersState)]),
-                     ok = gen_server2:cast(
-                            Neighbour, {catch_up, Self, MembersState}),
-                     State1
-             end,
+    State1 = maybe_send_catchup(Right, check_neighbours(Group, State)),
     noreply(case Left of %% original left
                 {Member, _MRef2} ->
                     Msg = {?TAG, {member_left, Member}},
                     callback(Callback,
                              [{Self, 0, [{undefined, Msg}], []}],
-                             broadcast_internal(Msg, State2));
+                             broadcast_internal(Msg, State1));
                 _ ->
-                    State2
+                    State1
             end).
 
 terminate(normal, _State) ->
@@ -652,6 +640,19 @@ broadcast_internal(Msg, State = #state { self          = Self,
                 MembersState
         end,
     State #state { members_state = MembersState1, pub_count = PubCount + 1 }.
+
+maybe_send_catchup(Right, State = #state { right = Right }) ->
+    State;
+maybe_send_catchup(_Right, State = #state { self  = Self,
+                                            right = {Self, undefined} }) ->
+    State #state { members_state = blank_member_state() };
+maybe_send_catchup(_Right, State = #state { self          = Self,
+                                            right         = {Neighbour, _MRef},
+                                            members_state = MembersState }) ->
+    io:format("~p ~p sending catchup to ~p~n",
+              [now(), Self, Neighbour]),
+    ok = gen_server2:cast(Neighbour, {catch_up, Self, MembersState}),
+    State.
 
 %% ---------------------------------------------------------------------------
 %% Members helpers
