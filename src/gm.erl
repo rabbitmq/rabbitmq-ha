@@ -285,6 +285,7 @@ handle_cast(A = {activity, {From, To, Msgs}}, State) ->
     end;
 
 handle_cast({catch_up, From, To, MembersStateFrom, ViewFrom}, State) ->
+    io:format("~p sent catch_up with view ~p~n", [self(), draw_view(self(), ViewFrom)]),
     State1 = #state { self          = Self,
                       view          = View,
                       members_state = MembersState } =
@@ -339,6 +340,7 @@ handle_cast(join, State = #state { self       = Self,
     Group = join_group_internal(Self, GroupName),
     View = group_to_view(Group),
     State1 = check_neighbours(Group, State #state { view = View }),
+    io:format("~p Joined with initial view ~p~n", [Self, draw_view(Self, View)]),
     noreply(internal_broadcast(
               [{?TAG, {birth_of, Self, view_successor(Self, View)}}], State1));
 
@@ -611,7 +613,14 @@ update_view(From, To, Self, View) ->
             %% intermediates yet. Thus:
             true = ((dict:fetch(From, View)) #view_member.right =:= Self)
                 orelse sets:is_element(To, Aliases), %% ASSERTION
-            {[], View};
+            %% However, if we can't find the To at all, it suggests it
+            %% died before we joined and as our upstream hasn't
+            %% noticed its death, we could well be responsible for
+            %% sending out the death notification.
+            {case dict:find(To, View) of
+                 error   -> [To];
+                 {ok, _} -> []
+             end, View};
         #view_member { left = Left, aliases = Aliases } = MemberSelf ->
             case dict:find(From, View) of
                 error ->
@@ -681,6 +690,7 @@ process_view_msgs1(Pubs, View) ->
                               %% we don't know about the Right: Id
                               %% knew of Right when it joined, but
                               %% we're yet to be told about it.
+                              io:format("~p lacking any knowledge of ~p~n", [self(), Right]),
                               dict_cons({requires, Right}, Birth, ViewAcc);
                           #view_member { id = Self, left = Self, right = Self } =
                           MemberSelf ->
@@ -718,14 +728,28 @@ process_view_msgs1(Pubs, View) ->
               case dict:fetch(Id, ViewAcc) of
                   {alias_of, _Id} ->
                       ViewAcc;
-                  #view_member { right = Right } = MemberDead ->
+                  #view_member { left = Self, right = Self } = MemberDead ->
+                      #view_member { aliases = Aliases } = MemberSelf =
+                          dict:fetch(Self, ViewAcc),
+                      {Aliases1, ViewAcc1} =
+                          become_aliases(Self, [MemberDead], Aliases, ViewAcc),
+                      MemberSelf1 =
+                          MemberSelf #view_member { left = Self,
+                                                    right = Self,
+                                                    aliases = Aliases1 },
+                      store_view_member(MemberSelf1, ViewAcc1);
+                  #view_member { left = Left, right = Right } = MemberDead ->
                       #view_member { aliases = Aliases } = MemberRight =
                           dict:fetch(Right, ViewAcc),
+                      #view_member {} = MemberLeft = dict:fetch(Left, ViewAcc),
                       {Aliases1, ViewAcc1} =
                           become_aliases(Right, [MemberDead], Aliases, ViewAcc),
                       MemberRight1 =
-                          MemberRight #view_member { aliases = Aliases1 },
-                      store_view_member(MemberRight1, ViewAcc1)
+                          MemberRight #view_member { left = Left,
+                                                     aliases = Aliases1 },
+                      MemberLeft1 =
+                          MemberLeft #view_member { right = Right },
+                      store_view_members([MemberLeft1, MemberRight1], ViewAcc1)
               end;
           (_Msg, ViewAcc) ->
               ViewAcc
