@@ -170,8 +170,10 @@ pred receive [p, p' : Process] {
 		m.payload in Pub and
 		(all spawn : Process |
 			some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
-				(spawn.(p.process_state.pending_acks) - m.payload) = (spawn.(p'.process_state.pending_acks) - m.payload)) and
-		one spawn : Process | process_spawn[spawn, m.from] and m.payload in spawn.(p'.process_state.pending_acks)
+				(spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks) or
+				(process_spawn[spawn, m.from] and ((m.payload + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
+		) and
+		(one spawn : Process | process_spawn[spawn, m.from] and m.payload in spawn.(p'.process_state.pending_acks))
 }
 
 pred process_reduction [p, p' : Process] {
@@ -184,6 +186,8 @@ fact { all p, p' : Process | p' = p.process_reduces_to => process_reduction[p, p
 pred example {
 	#Pub > 1
 	#Member > 1
+	#View = 3
+	#Member > 4
 }
-run example for exactly 1 View, 2 Member, 2 Message, 6 Process, 0 Ack, 2 Pub, 6 ProcessState
+run example for 8
 
