@@ -56,7 +56,8 @@ check membership_changes_by_one {
 
 sig Message {
 	from : one Process,
-	to : one Process
+	to : one Process,
+	payload : one Payload
 }{
 	no (from & to)
 }
@@ -70,11 +71,15 @@ fact { all p : Process | lone (p.~from + p.~to) }
 fact { all m : Message | no ((m.from + m.to).^~process_reduces_to) & m.from.^(*process_reduces_to.~from.to) }
 
 sig Process {
-	process_reduces_to : lone Process
+	process_reduces_to : lone Process,
+	process_state : one ProcessState
 }{
 	no (this & this.^@process_reduces_to) // no cycles
-	lone this.~@process_reduces_to // at most one predecessor
+	lone this.~@process_reduces_to // at most one predecessor	
 }
+
+// the first process can't do anything, and has a blank state
+fact { all p : Process | (no p.~process_reduces_to) => (no (p.~from + p.~to) and no p.process_state.pending_acks )}
 
 check message_goes_forward {
 	all m : Message | no (m.from.*~process_reduces_to & m.to.*process_reduces_to)
@@ -113,10 +118,72 @@ fact { all m : Message | m.to.~process.~members in m.from.~process.~members.*nex
 // READ: "There is a non-empty set formed by the intersection of [the (reflexive) ancestors of the destination process of the message] with [the processes in the sender's view]"
 fact { all m : Message | some (m.to.*~process_reduces_to & m.from.~process.~members.members.process) }
 
-pred example {
-	3 < #Member
-	all p : Process | some (p.~from + p.~to)
-	all m : Message | no (m.from.*process_reduces_to & m.to)
+pred process_spawn [p, p' : Process] {
+	p' in p.*process_reduces_to and no p.~process_reduces_to
 }
-run example for exactly 2 View, 5 Member, 3 Message, 6 Process
+
+abstract sig Payload {}
+
+sig Pub extends Payload {}
+
+sig Ack extends Payload {
+	pub : one Pub
+}{
+	one pub.~@pub
+}
+
+sig ProcessState {
+	pending_acks : Process -> set Pub
+}{
+	all p : Process | some p.pending_acks => no p.~process_reduces_to
+}
+
+// every processstate is linked to from a process
+fact { ProcessState = Process.process_state }
+// every pub is linked to from a message
+fact { Pub in Message.payload }
+// processes that share the same process_state must be a reduction of the other
+fact { all p, p' : Process | p.process_state = p'.process_state => (p in p'.*process_reduces_to or p' in p.*process_reduces_to) }
+
+pred tau [p, p' : Process] {
+	p.process_state = p'.process_state
+	no p' & (Message.from + Message.to)
+}
+
+pred publish [p, p' : Process] {
+	one m : Message |
+		m.from = p' and // p' is sending a message
+		m.to in p'.~process.right.process.*process_reduces_to and // it's sending it to the right
+		m.payload in Pub and // the message is a Pub
+		(no spawn : Process | m.payload in spawn.(p.process_state.pending_acks)) and // we don't have the pub in any pending_ack set
+		(all spawn : Process |
+			some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
+				((spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks)) or // either they're the same or we're just gaining the appropriate extra entry
+				(process_spawn[spawn, p'] and ((m.payload + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
+		) and
+		(one spawn : Process | process_spawn[spawn, p'] and m.payload in spawn.(p'.process_state.pending_acks)) // make sure we add the entry
+}
+
+pred receive [p, p' : Process] {
+	one m : Message |
+		m.to = p' and
+		m.payload in Pub and
+		(all spawn : Process |
+			some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
+				(spawn.(p.process_state.pending_acks) - m.payload) = (spawn.(p'.process_state.pending_acks) - m.payload)) and
+		one spawn : Process | process_spawn[spawn, m.from] and m.payload in spawn.(p'.process_state.pending_acks)
+}
+
+pred process_reduction [p, p' : Process] {
+	tau[p, p'] <=> not (publish[p, p'] <=> not receive[p, p'])
+}
+
+fact { all p, p' : Process | p' = p.process_reduces_to => process_reduction[p, p'] }
+// fact { all ps, ps' : ProcessState, p, p' : Process | (p' = p.process_reduces_to and ps = p.process_state and ps' = p'.process_state
+
+pred example {
+	#Pub > 1
+	#Member > 1
+}
+run example for exactly 1 View, 2 Member, 2 Message, 6 Process, 0 Ack, 2 Pub, 6 ProcessState
 
