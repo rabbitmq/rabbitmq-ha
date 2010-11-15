@@ -38,27 +38,35 @@ pred add_member [v, v' : View] {
 	v.members = v.members & v'.members.~member_reduces_to
 }
 
-pred remove_rember [v, v' : View] {
+pred remove_member [v, v' : View] {
 	one v.members - v'.members.~member_reduces_to
 	v'.members = v'.members & v.members.member_reduces_to
 }
 
-pred reduction [v, v' : View] {
+pred view_change [v, v' : View] {
 	add_member[v, v'] <=> not remove_member[v, v']
 }
 
-fact { all v, v' : View | v' = v.next => reduction[v, v'] } // there must be a reduction linking consecutive views
+fact { all v, v' : View | v' = v.next => view_change[v, v'] } // there must be a reduction linking consecutive views
 
 check membership_changes_by_one {
 	all v, v' : View | v' = v.next => (#v'.members = #v.members +1 or #v'.members = #v.members -1)
 } for 10
 
 sig Message {
-	from : Process,
-	to : Process
+	from : one Process,
+	to : one Process
 }{
-	// somehow need to express that other communications between from and to must happen completely before or after this one
+	no (from & to)
 }
+
+// each process can be involved in at most one send xor one receive
+fact { all p : Process | lone (p.~from + p.~to) }
+
+// take a message between two processes:
+// there is no intersection between the past of the message's from or to with any future state reachable from this or any subsequent message reachable from this.
+// Enforces asynchronous communication that obeys temporal mechanics
+fact { all m : Message | no ((m.from + m.to).^~process_reduces_to) & m.from.^(*process_reduces_to.~from.to) }
 
 sig Process {
 	process_reduces_to : lone Process
@@ -67,5 +75,26 @@ sig Process {
 	lone this.~@process_reduces_to // at most one predecessor
 }
 
-pred example {}
-run example for 0 Member, 1 View, 10 Message, 5 Process
+check message_goes_forward {
+	all m : Message | no (m.from.*~process_reduces_to & m.to.*process_reduces_to)
+} for 0 Member, 1 View, 3 Message, 8 Process
+
+check messages_receive_order_matches_send_order {
+	all m, m' : Message |
+		((m'.from in m.from.*process_reduces_to) and
+		some (m.to.*process_reduces_to & m'.to.*process_reduces_to)) =>
+			m'.to in m.to.*process_reduces_to
+} for 0 Member, 1 View, 3 Message, 8 Process
+
+// be as loose as possible in specifying the overlap, to allow other facts to enforce ordering
+pred can_send_to_self {
+	all m : Message | some (m.to.*process_reduces_to & m.from.*process_reduces_to)
+	all p : Process | some (p.~from + p.~to)
+}
+run can_send_to_self for exactly 0 Member, 1 View, 3 Message, 6 Process
+
+pred example {
+	4 = #process_reduces_to
+	all p : Process | some (p.~from + p.~to)
+}
+run example for exactly 0 Member, 1 View, 3 Message, 6 Process
