@@ -3,7 +3,8 @@ module gm
 sig Member {
 	left : one Member,
 	right : one Member,
-	member_reduces_to : lone Member
+	member_reduces_to : lone Member,
+	process : some Process
 }{
 	this in this.^@right // enforce a ring
 	no (this & this.^@member_reduces_to) // no cycles
@@ -77,24 +78,44 @@ sig Process {
 
 check message_goes_forward {
 	all m : Message | no (m.from.*~process_reduces_to & m.to.*process_reduces_to)
-} for 0 Member, 1 View, 3 Message, 8 Process
+} for 7
 
 check messages_receive_order_matches_send_order {
 	all m, m' : Message |
 		((m'.from in m.from.*process_reduces_to) and
 		some (m.to.*process_reduces_to & m'.to.*process_reduces_to)) =>
 			m'.to in m.to.*process_reduces_to
-} for 0 Member, 1 View, 3 Message, 8 Process
+} for 7
 
 // be as loose as possible in specifying the overlap, to allow other facts to enforce ordering
 pred can_send_to_self {
 	all m : Message | some (m.to.*process_reduces_to & m.from.*process_reduces_to)
 	all p : Process | some (p.~from + p.~to)
 }
-run can_send_to_self for exactly 0 Member, 1 View, 3 Message, 6 Process
+run can_send_to_self for exactly 1 Member, 1 View, 3 Message, 6 Process
+
+// limit the reduction of a process to the reduction of a member
+fact {
+	all m : Member, p : Process |
+		p in m.process => p.*process_reduces_to in m.(*member_reduces_to).process
+}
+// all processes can be reached through members
+fact { Process = Member.(*member_reduces_to).process }
+// a process is owned by at most one member
+fact { all p : Process | lone p.~process }
+// all the processes a member owns form a single chain of reduction
+fact { all p, p' : Process, m : Member | (p in m.process and p' in m.process) => (p' in p.*process_reduces_to or p in p'.*process_reduces_to) }
+// if a member reduces then it must continue reducing the same process
+fact { all m : Member, p : Process | (p in m.process and some m.member_reduces_to) => (m.member_reduces_to.process in p.*process_reduces_to) }
+// messages must be received in the current or any future view
+fact { all m : Message | m.to.~process.~members in m.from.~process.~members.*next }
+// a message cannot be sent to a process which does not have a forefather in the sender's view (knowledge of peers is limited to the present and past)
+fact { all m : Message | some (m.to.*~process_reduces_to & m.from.~process.~members.members.process) }
 
 pred example {
-	4 = #process_reduces_to
+	3 < #Member
 	all p : Process | some (p.~from + p.~to)
+	all m : Message | no (m.from.*process_reduces_to & m.to)
 }
-run example for exactly 0 Member, 1 View, 3 Message, 6 Process
+run example for exactly 2 View, 5 Member, 3 Message, 6 Process
+
