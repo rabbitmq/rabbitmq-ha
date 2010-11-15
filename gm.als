@@ -110,6 +110,7 @@ fact { all m : Member, p : Process | (p in m.process and some m.member_reduces_t
 // messages must be received in the current or any future view
 fact { all m : Message | m.to.~process.~members in m.from.~process.~members.*next }
 // a message cannot be sent to a process which does not have a forefather in the sender's view (knowledge of peers is limited to the present and past)
+// READ: "There is a non-empty set formed by the intersection of [the (reflexive) ancestors of the destination process of the message] with [the processes in the sender's view]"
 fact { all m : Message | some (m.to.*~process_reduces_to & m.from.~process.~members.members.process) }
 
 pred example {
