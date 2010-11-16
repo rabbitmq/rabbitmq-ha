@@ -118,13 +118,13 @@ fact { all m : Message | m.to.~process.~members in m.from.~process.~members.*nex
 // READ: "There is a non-empty set formed by the intersection of [the (reflexive) ancestors of the destination process of the message] with [the processes in the sender's view]"
 fact { all m : Message | some (m.to.*~process_reduces_to & m.from.~process.~members.members.process) }
 
-pred process_spawn [p, p' : Process] {
-	p' in p.*process_reduces_to and no p.~process_reduces_to
-}
-
 abstract sig Payload {}
 
-sig Pub extends Payload {}
+sig Pub extends Payload {
+	publisher : one Process
+}{
+	no publisher.~process_reduces_to
+}
 
 sig Ack extends Payload {
 	pub : one Pub
@@ -150,44 +150,50 @@ pred tau [p, p' : Process] {
 	no p' & (Message.from + Message.to)
 }
 
-pred publish [p, p' : Process] {
+pred inject_pub [p, p' : Process] {
 	one m : Message |
+		m.payload in Pub and // the message is a Pub
+		m.payload.publisher in p.*~process_reduces_to and // new publish, by us
 		m.from = p' and // p' is sending a message
 		m.to in p'.~process.right.process.*process_reduces_to and // it's sending it to the right
-		m.payload in Pub and // the message is a Pub
 		(no spawn : Process | m.payload in spawn.(p.process_state.pending_acks)) and // we don't have the pub in any pending_ack set
-		(all spawn : Process |
-			some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
-				((spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks)) or // either they're the same or we're just gaining the appropriate extra entry
-				(process_spawn[spawn, p'] and ((m.payload + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
-		) and
-		(one spawn : Process | process_spawn[spawn, p'] and m.payload in spawn.(p'.process_state.pending_acks)) // make sure we add the entry
+		ensure_in_pending_acks[p, p', m] // it certainly will be in p''s pending_ack set
 }
 
-pred receive [p, p' : Process] {
+pred receive_pub [p, p' : Process] {
 	one m : Message |
-		m.to = p' and
-		m.payload in Pub and
-		(all spawn : Process |
-			some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
-				(spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks) or
-				(process_spawn[spawn, m.from] and ((m.payload + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
-		) and
-		(one spawn : Process | process_spawn[spawn, m.from] and m.payload in spawn.(p'.process_state.pending_acks))
+		m.payload in Pub and // the message is a Pub
+		m.to = p' and // p' receives the msg
+		ensure_in_pending_acks[p, p', m]
+}
+
+pred forward_pub [p, p' : Process] {
+	receive_pub[p.~process_reduces_to, p] and
+	p.process_state = p'.process_state and
+	one m : Message |
+		m.payload = p.~from.payload and
+		m.from = p' and
+		m.to in p'.~process.right.process.*process_reduces_to
+}
+
+pred ensure_in_pending_acks [p, p' : Process, m : Message] {
+	(all spawn : Process |
+		some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
+			(spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks) or
+			(spawn = m.payload.publisher and ((m.payload + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
+	) and
+	(m.payload in m.payload.publisher.(p'.process_state.pending_acks))
 }
 
 pred process_reduction [p, p' : Process] {
-	tau[p, p'] <=> not (publish[p, p'] <=> not receive[p, p'])
+	tau[p, p'] <=> not (inject_pub[p, p'] <=> not (receive_pub[p, p'] <=> not forward_pub[p, p']))
 }
 
 fact { all p, p' : Process | p' = p.process_reduces_to => process_reduction[p, p'] }
-// fact { all ps, ps' : ProcessState, p, p' : Process | (p' = p.process_reduces_to and ps = p.process_state and ps' = p'.process_state
 
 pred example {
 	#Pub > 1
 	#Member > 1
-	#View = 3
-	#Member > 4
+	#View = 1
 }
-run example for 8
-
+run example for 10
