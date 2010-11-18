@@ -144,10 +144,11 @@ fact { Pub + Ack in Message.payload }
 fact { all p, p' : Process | p.process_state = p'.process_state => (p in p'.*process_reduces_to or p' in p.*process_reduces_to) }
 
 pred tau [p : Process] {
-	let p' = p.process_reduces_to |
-		p.process_state = p'.process_state and
-		no p.~to and // we can't receive anything
-		no p'.~from // we can't cause anything to be sent
+	some p.process_reduces_to =>
+		(let p' = p.process_reduces_to |
+			p.process_state = p'.process_state and
+			no p.~to and // we can't receive anything
+			no p'.~from) // we can't cause anything to be sent
 }
 
 pred inject_pub [p : Process] {
@@ -158,7 +159,8 @@ pred inject_pub [p : Process] {
 			m.from = p' and // p' is sending a message
 			m.to in p'.~process.right.process.*process_reduces_to and // it's sending it to the right
 			(no spawn : Process | m.payload in spawn.(p.process_state.pending_acks)) and // we don't have the pub in any pending_ack set
-			ensure_in_pending_acks[p, p', m.payload] // it certainly will be in p''s pending_ack set
+			m.payload in m.payload.publisher.(p'.process_state.pending_acks) and // we do in p'
+			equal_process_state_but_for_pub[p, p', m.payload] // and everything else is equal
 }
 
 pred receive_to_death [p : Process] {
@@ -169,7 +171,7 @@ pred receive_pub [p, p' : Process] {
 	one m : Message |
 		m.payload in Pub and // the message is a Pub
 		m.to = p and // p' receives the msg
-		ensure_in_pending_acks[p, p', m.payload]
+		equal_process_state_but_for_pub[p, p', m.payload]
 }
 
 pred forward_pub [p : Process] {
@@ -178,28 +180,29 @@ pred forward_pub [p : Process] {
 		one m : Message |
 			m.payload = p.~to.payload and
 			m.from = p' and
-			m.to in p'.~process.right.process.*process_reduces_to
+			m.to in p'.~process.right.process.*process_reduces_to and
+			not m.payload in m.payload.publisher.(p.process_state.pending_acks) and
+			m.payload in m.payload.publisher.(p'.process_state.pending_acks)
 }
 
 pred pub_to_ack [p : Process] {
 	let p' = p.process_reduces_to |
-		let p'' = p'.process_reduces_to |
-			receive_pub[p, p'] and
-			no p'.~from + p'.~to and
-			some m : Message |
-				m.payload in Ack and
-				m.payload.pub = p.~to.payload and
-				m.from = p'' and
-				m.to in p''.~process.right.process.*process_reduces_to and
-				ensure_in_pending_acks[p'', p', m.payload.pub] and
-				not m.payload.pub in m.payload.pub.publisher.(p''.process_state.pending_acks)
+		receive_pub[p, p'] and
+		some m : Message |
+			m.payload in Ack and
+			m.payload.pub = p.~to.payload and
+			m.from = p' and
+			m.to in p'.~process.right.process.*process_reduces_to and
+			equal_process_state_but_for_pub[p, p', m.payload.pub] and
+			m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) and
+			not m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks)
 }
 
 pred receive_ack [p, p' : Process] {
 	some m : Message |
 		m.payload in Ack and
 		m.to = p and
-		ensure_in_pending_acks[p', p, m.payload.pub]
+		equal_process_state_but_for_pub[p, p', m.payload.pub]
 }
 
 pred forward_ack [p : Process] {
@@ -209,34 +212,44 @@ pred forward_ack [p : Process] {
 			m.payload = p.~to.payload and
 			m.from = p' and
 			m.to in p'.~process.right.process.*process_reduces_to and
-			m.payload.pub not in m.payload.pub.publisher.(p'.process_state.pending_acks)
+			m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) and
+			not m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks)
 }
 
-pred ensure_in_pending_acks [p, p' : Process, m : Pub] {
-	(all spawn : Process |
+pred retire_ack [p : Process] {
+	let p' = p.process_reduces_to |
+		receive_ack[p, p'] and
+		not p.~to.payload.pub in p.~to.payload.pub.publisher.(p.process_state.pending_acks) and
+		p.process_state = p'.process_state and
+		no p'.~from
+}
+
+pred equal_process_state_but_for_pub [p, p' : Process, m : Pub] {
+	all spawn : Process |
 		some (spawn.(p.process_state.pending_acks) + spawn.(p'.process_state.pending_acks)) =>
 			(spawn.(p.process_state.pending_acks) = spawn.(p'.process_state.pending_acks) or
-			(spawn = m.publisher and ((m + spawn.(p.process_state.pending_acks)) = spawn.(p'.process_state.pending_acks))))
-	) and
-	(m in m.publisher.(p'.process_state.pending_acks))
+			(spawn = m.publisher and ((spawn.(p.process_state.pending_acks) - m) = (spawn.(p'.process_state.pending_acks) - m))))
 }
 
 pred process_reduction [p : Process] {
-//	tau[p] or
 	inject_pub[p] or
-	receive_to_death[p] or
 	forward_pub[p] or
 	pub_to_ack[p] or
-	forward_ack[p]
+	forward_ack[p] or
+	retire_ack[p] or
+	receive_to_death[p] or
+	tau[p]
 }
 
-fact { all p : Process | process_reduction[p] or process_reduction[p.~process_reduces_to] or process_reduction[p.~process_reduces_to.~process_reduces_to]}
+fact { all p : Process | process_reduction[p] }
 
 pred example {
-	some fa: Process | forward_ack[fa]
-	some i: Process | inject_pub[i]
+	one ip: Process | inject_pub[ip]
+	one fp: Process | forward_pub[fp]
+	one pa: Process | pub_to_ack[pa]
+	one fa: Process | forward_ack[fa]
+	one ra: Process | retire_ack[ra]
 	#View = 1
 	#Member = 2
-	//#Process = 5
 }
-run example for 8
+run example for 12
