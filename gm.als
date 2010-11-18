@@ -248,8 +248,6 @@ pred process_reduction [p : Process] {
 fact { all p : Process | process_reduction[p] }
 
 pred example {
-//	some disj fp, fp': Process | forward_pub[fp] and forward_pub[fp']
-//	some ip: Process | inject_pub[ip]
 	some ra: Process | retire_ack[ra]
 	#Member = 3
 }
