@@ -52,18 +52,18 @@ fact { all v, v' : View | v' = v.next => view_change[v, v'] } // there must be a
 
 check membership_changes_by_one {
 	all v, v' : View | v' = v.next => (#v'.members = #v.members +1 or #v'.members = #v.members -1)
-} for 10
+} for 5
 
 sig Message {
 	from : one Process,
 	to : one Process,
 	payload : one Payload
 }{
-	no (from & to)
+	no (from & to) // if we want to send to ourself, it has to be received in the future
 }
 
-// each process can be involved in at most one send xor one receive
-fact { all p : Process | lone (p.~from + p.~to) }
+// each process can be involved in at most one send and one receive
+fact { all p : Process | lone p.~from and lone p.~to }
 
 // take a message between two processes:
 // there is no intersection between the past of the message's from or to with any future state reachable from this or any subsequent message reachable from this.
@@ -78,8 +78,8 @@ sig Process {
 	lone this.~@process_reduces_to // at most one predecessor	
 }
 
-// the first process can't do anything, and has a blank state
-fact { all p : Process | (no p.~process_reduces_to) => (no (p.~from + p.~to) and no p.process_state.pending_acks )}
+// the first process can't do send and has a blank state
+fact { all p : Process | (no p.~process_reduces_to) => (no (p.~from) and no p.process_state.pending_acks )}
 
 check message_goes_forward {
 	all m : Message | no (m.from.*~process_reduces_to & m.to.*process_reduces_to)
@@ -93,11 +93,13 @@ check messages_receive_order_matches_send_order {
 } for 7
 
 // be as loose as possible in specifying the overlap, to allow other facts to enforce ordering
+/* commented out as this one requires lots else in here to be commented out
 pred can_send_to_self {
 	all m : Message | some (m.to.*process_reduces_to & m.from.*process_reduces_to)
 	all p : Process | some (p.~from + p.~to)
 }
-run can_send_to_self for exactly 1 Member, 1 View, 3 Message, 6 Process
+run can_send_to_self for 6
+*/
 
 // limit the reduction of a process to the reduction of a member
 fact {
@@ -144,84 +146,86 @@ fact { Pub + Ack in Message.payload }
 fact { all p, p' : Process | p.process_state = p'.process_state => (p in p'.*process_reduces_to or p' in p.*process_reduces_to) }
 
 pred tau [p : Process] {
-	some p.process_reduces_to =>
-		(let p' = p.process_reduces_to |
-			p.process_state = p'.process_state and
-			no p.~to and // we can't receive anything
-			no p'.~from) // we can't cause anything to be sent
+	no p.~to // we can't receive anything
+	no p.~from // we can't send anything
+	some p.~process_reduces_to => p.process_state = p.~process_reduces_to.process_state
 }
 
 pred inject_pub [p : Process] {
-	let p' = p.process_reduces_to |
+	no p.~to and
+	let p' = p.~process_reduces_to |
 		one m : Message |
 			m.payload in Pub and // the message is a Pub
 			m.payload.publisher in p.*~process_reduces_to and // new publish, by us
-			m.from = p' and // p' is sending a message
-			m.to in p'.~process.right.process.*process_reduces_to and // it's sending it to the right
-			(no spawn : Process | m.payload in spawn.(p.process_state.pending_acks)) and // we don't have the pub in any pending_ack set
-			m.payload in m.payload.publisher.(p'.process_state.pending_acks) and // we do in p'
-			equal_process_state_but_for_pub[p, p', m.payload] // and everything else is equal
+			m.from = p and // p' is sending a message
+			m.to in p.~process.right.process.*process_reduces_to and // it's sending it to the right
+			(no spawn : Process | m.payload in spawn.(p'.process_state.pending_acks)) and // we didn't have the pub in any pending_ack set
+			m.payload in m.payload.publisher.(p.process_state.pending_acks) and // but we do now
+			equal_process_state_but_for_pub[p', p, m.payload] // and everything else is equal
 }
 
 pred receive_to_death [p : Process] {
 	all p' : Process | p' in p.*process_reduces_to => (some p'.~to and p'.process_state = p.process_state and no p'.~from)
 }
 
-pred receive_pub [p, p' : Process] {
+pred receive_pub [p', p : Process] {
 	one m : Message |
 		m.payload in Pub and // the message is a Pub
-		m.to = p and // p' receives the msg
-		equal_process_state_but_for_pub[p, p', m.payload]
+		m.to = p and // p receives the msg
+		equal_process_state_but_for_pub[p', p, m.payload]
 }
 
 pred forward_pub [p : Process] {
-	let p' = p.process_reduces_to |
-		receive_pub[p, p'] and
+	let p' = p.~process_reduces_to |
+		receive_pub[p', p] and
 		one m : Message |
 			m.payload = p.~to.payload and
-			m.from = p' and
-			m.to in p'.~process.right.process.*process_reduces_to and
-			not m.payload in m.payload.publisher.(p.process_state.pending_acks) and
-			m.payload in m.payload.publisher.(p'.process_state.pending_acks)
+			m.from = p and
+			m.to in p.~process.right.process.*process_reduces_to and
+			not m.payload.publisher in p.*~process_reduces_to and // we didn't publish it
+			not m.payload in m.payload.publisher.(p'.process_state.pending_acks) and // we didn't know about it before
+			m.payload in m.payload.publisher.(p.process_state.pending_acks) // we do know about it now
 }
 
 pred pub_to_ack [p : Process] {
-	let p' = p.process_reduces_to |
-		receive_pub[p, p'] and
+	let p' = p.~process_reduces_to |
+		receive_pub[p', p] and
 		some m : Message |
 			m.payload in Ack and
 			m.payload.pub = p.~to.payload and
-			m.from = p' and
+			m.from = p and
 			m.to in p'.~process.right.process.*process_reduces_to and
-			equal_process_state_but_for_pub[p, p', m.payload.pub] and
-			m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) and
-			not m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks)
+			m.payload.pub.publisher in p.*~process_reduces_to and // we published it
+			m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks) and // it was in our pending acks
+			not m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) // it's no longer in our pending acks
 }
 
-pred receive_ack [p, p' : Process] {
+pred receive_ack [p', p : Process] {
 	some m : Message |
 		m.payload in Ack and
 		m.to = p and
-		equal_process_state_but_for_pub[p, p', m.payload.pub]
+		equal_process_state_but_for_pub[p', p, m.payload.pub]
 }
 
 pred forward_ack [p : Process] {
-	let p' = p.process_reduces_to |
-		receive_ack[p, p'] and
+	let p' = p.~process_reduces_to |
+		receive_ack[p', p] and
 		some m : Message |
 			m.payload = p.~to.payload and
-			m.from = p' and
-			m.to in p'.~process.right.process.*process_reduces_to and
-			m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) and
-			not m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks)
+			m.from = p and
+			m.to in p.~process.right.process.*process_reduces_to and
+			not m.payload.pub.publisher in p.*~process_reduces_to and // we didn't publish it
+			m.payload.pub in m.payload.pub.publisher.(p'.process_state.pending_acks) and // we did know about it
+			not m.payload.pub in m.payload.pub.publisher.(p.process_state.pending_acks) // but we've now forgotten about it
 }
 
 pred retire_ack [p : Process] {
-	let p' = p.process_reduces_to |
-		receive_ack[p, p'] and
-		not p.~to.payload.pub in p.~to.payload.pub.publisher.(p.process_state.pending_acks) and
-		p.process_state = p'.process_state and
-		no p'.~from
+	no p.~from and
+	let p' = p.~process_reduces_to |
+		receive_ack[p', p] and
+		p.~to.payload.pub.publisher in p.*~process_reduces_to and // we published it
+		not p.~to.payload.pub in p.~to.payload.pub.publisher.(p.process_state.pending_acks) and // we're not pending on this
+		p.process_state = p'.process_state
 }
 
 pred equal_process_state_but_for_pub [p, p' : Process, m : Pub] {
@@ -244,12 +248,9 @@ pred process_reduction [p : Process] {
 fact { all p : Process | process_reduction[p] }
 
 pred example {
-	one ip: Process | inject_pub[ip]
-	one fp: Process | forward_pub[fp]
-	one pa: Process | pub_to_ack[pa]
-	one fa: Process | forward_ack[fa]
-	one ra: Process | retire_ack[ra]
-	#View = 1
-	#Member = 2
+//	some disj fp, fp': Process | forward_pub[fp] and forward_pub[fp']
+//	some ip: Process | inject_pub[ip]
+	some ra: Process | retire_ack[ra]
+	#Member = 3
 }
-run example for 12
+run example for 10 but 1 View, 3 Member
