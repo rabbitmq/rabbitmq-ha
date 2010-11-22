@@ -192,10 +192,11 @@
           callback,
           view,
           pub_count,
-          members_state
+          members_state,
+          pending_join
         }).
 
--record(gm_group, { name, members }).
+-record(gm_group, { name, version, members }).
 
 -record(view_member, { id, aliases, left, right }).
 
@@ -225,7 +226,8 @@ leave(Server) ->
     gen_server2:cast(Server, leave).
 
 broadcast(Server, Msg) ->
-    ok. %%gen_server2:cast(Server, {broadcast, Msg}).
+    gen_server2:cast(Server, {broadcast, Msg}).
+
 
 init([GroupName, Callback]) ->
     process_flag(trap_exit, true),
@@ -239,116 +241,166 @@ init([GroupName, Callback]) ->
                   callback      = Callback,
                   view          = undefined,
                   pub_count     = 0,
-                  members_state = blank_member_state() }, hibernate,
+                  members_state = undefined,
+                  pending_join  = queue:new() }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
+
 
 handle_call(Msg, _From, State) ->
     {stop, {unexpected_msg, Msg}, State}.
 
-handle_cast(A = {activity, {From, To, Msgs}}, State) ->
-    io:format("~p ~p~n", [self(), A]),
-    State1 = #state { self          = Self,
-                      right         = Right,
-                      view          = View,
-                      members_state = MembersState } =
-        freshen_view(From, To, Msgs, State),
-    case is_alive(From, View) of
-        true ->
-            MemberSelf = view_fetch(Self, View),
-            {MembersState2, Output1} =
-                lists:foldl(
-                  fun ({Id, Pubs, Acks}, MembersStateOutput) ->
-                          with_member_acc(
-                            fun (PA, Output2) ->
-                                    case is_alias_of(Id, MemberSelf) of
-                                        true ->
-                                            {ToAck, PA1} =
-                                                find_common(
-                                                  queue:from_list(Pubs), PA,
-                                                  queue:new()),
-                                            {PA1, output_cons(
-                                                    Id, [],
-                                                    acks_from_queue(ToAck),
-                                                    Output2)};
-                                        false ->
-                                            {apply_acks(Acks,
-                                                        join_pubs(PA, Pubs)),
-                                             output_cons(Id, Pubs, Acks,
-                                                         Output2)}
-                                    end
-                            end, Id, MembersStateOutput)
-                  end, {MembersState, output_nil()}, Msgs),
-            send_right(Self, View, Right, Output1),
-            noreply(State1 #state { members_state = MembersState2 });
-        false ->
-            noreply(State1)
-    end;
 
-handle_cast({catch_up, From, To, MembersStateFrom, ViewFrom}, State) ->
-    io:format("~p sent catch_up with view ~p~n", [self(), draw_view(self(), ViewFrom)]),
-    State1 = #state { self          = Self,
-                      view          = View,
-                      members_state = MembersState } =
-        freshen_view(From, To, [], State #state { view = ViewFrom }),
-    case is_alive(From, View) of
-        true ->
-            MemberSelf = view_fetch(Self, View),
-            AllMembers = lists:usort(dict:fetch_keys(MembersState) ++
-                                         dict:fetch_keys(MembersStateFrom)),
-            {MembersState1, Output} =
-                lists:foldl(
-                  fun (Id, MembersStateOutput) ->
-                          PAFrom = find_member_or_blank(Id, MembersStateFrom),
-                          with_member_acc(
-                            fun (PA, Output1) ->
-                                    {PA,
-                                     case is_alias_of(Id, MemberSelf) of
-                                         true ->
-                                             {_AcksInFlight, Pubs, _PA1} =
-                                                 find_prefix_common_suffix(
-                                                   PAFrom, PA),
-                                             output_cons(Id, [],
-                                                         acks_from_queue(Pubs),
-                                                         Output1);
-                                         false ->
-                                             {Acks, _Common, Pubs} =
-                                                 find_prefix_common_suffix(
-                                                   PA, PAFrom),
-                                             output_cons(Id,
-                                                         queue:to_list(Pubs),
-                                                         acks_from_queue(Acks),
-                                                         Output1)
-                                     end}
-                            end, Id, MembersStateOutput)
-                  end, {MembersState, output_nil()}, AllMembers),
-            io:format("~p calculated from catch_up ~p~n", [Self, output_finalise(Output)]),
-            handle_cast({activity, {From, To, output_finalise(Output)}},
-                        State1 #state { members_state = MembersState1 });
-        false ->
-            noreply(State1)
-    end;
+handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
+                                                  left       = {Left, _MRefL},
+                                                  right      = {Right, _MRefR},
+                                                  view       = View,
+                                                  group_name = GroupName }) ->
+    State1 = case needs_view_update(ReqVer, View) of
+                 true ->
+                     View1 = group_to_view(read_group(GroupName)),
+                     State2 = State #state { view = View1 },
+                     case fetch_view_member(Self, View1) of
+                         #view_member { left = Left, right = Right } ->
+                             State2;
+                         _ ->
+                             check_neighbours(State2)
+                     end;
+                 false ->
+                     State
+             end,
+    noreply(handle_msg(Msg, State1));
+
+handle_cast({broadcast, Msg}, State = #state { members_state = undefined,
+                                               pending_join  = PendingJoin,
+                                               pub_count     = PubCount }) ->
+    noreply(
+      State #state { pending_join = queue:in({PubCount, Msg}, PendingJoin),
+                     pub_count    = PubCount + 1 });
+
+handle_cast({broadcast, _Msg}, State = #state { self  = Self,
+                                                right = {Self, undefined} }) ->
+    noreply(State);
+
+handle_cast({broadcast, Msg},
+            State = #state { self          = Self,
+                             right         = {Right, _MRefR},
+                             view          = View,
+                             pub_count     = PubCount,
+                             members_state = MembersState }) ->
+    PubMsg = {PubCount, Msg},
+    Activity =
+        activity_finalise(activity_cons(Self, [PubMsg], [], activity_nil())),
+    ok = gen_server2:cast(Right, {?TAG, view_version(View),
+                                  {activity, Self, Activity}}),
+    MembersState1 =
+        with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, MembersState),
+    noreply(State #state { members_state = MembersState1,
+                           pub_count     = PubCount + 1 });
+
+handle_cast(join, State = #state { self       = Self,
+                                   group_name = GroupName }) ->
+    View = group_to_view(record_new_member_in_group(Self, GroupName)),
+    noreply(check_neighbours(State #state { view = View }));
 
 handle_cast(leave, State) ->
-    {stop, normal, State};
+    {stop, normal, State}.
 
-%% Link Layer
-handle_cast(join, State = #state { self       = Self,
-                                   left       = {Self, undefined},
-                                   right      = {Self, undefined},
-                                   group_name = GroupName,
-                                   view       = undefined }) ->
-    Group = join_group_internal(Self, GroupName),
-    View = group_to_view(Group),
-    State1 = check_neighbours(Group, State #state { view = View }),
-    io:format("~p Joined with initial view ~p~n", [Self, draw_view(Self, View)]),
-    noreply(internal_broadcast(
-              [{?TAG, {birth_of, Self, view_successor(Self, View)}}], State1));
 
-%% Link Layer
-handle_cast(check_neighbours, State = #state { group_name  = GroupName }) ->
-    noreply(check_neighbours(read_group(GroupName), State)).
+handle_msg(check_neighbours, State) ->
+    %% no-op - it's already been done by the calling handle_cast
+    State;
 
-%% Link Layer
+handle_msg({catchup, Left, MembersStateLeft},
+           State = #state { self          = Self,
+                            left          = {Left, _MRefL},
+                            right         = {Right, _MRefR},
+                            view          = View,
+                            members_state = undefined,
+                            pending_join  = PendingJoin }) ->
+    ok = gen_server2:cast(Right, {?TAG, view_version(View),
+                                  {catchup, Self, MembersStateLeft}}),
+    %%io:format("~p fully joined~n", [Self]),
+    case queue:to_list(PendingJoin) of
+        [] ->
+            State #state { members_state = MembersStateLeft };
+        Pubs ->
+            Activity = activity_finalise(
+                         activity_cons(Self, Pubs, [], activity_nil())),
+            ok = gen_server2:cast(Right, {?TAG, view_version(View),
+                                          {activity, Self, Activity}}),
+            MembersState1 = with_member(fun (_PA) -> PendingJoin end, Self,
+                                        MembersStateLeft),
+            State #state { members_state = MembersState1,
+                           pending_join  = queue:new() }
+    end;
+
+handle_msg({catchup, Left, MembersStateLeft},
+           State = #state { self = Self,
+                            left = {Left, _MRefL},
+                            view = View,
+                            members_state = MembersState })
+  when MembersState =/= undefined ->
+    AllMembers = lists:usort(dict:fetch_keys(MembersState) ++
+                                 dict:fetch_keys(MembersStateLeft)),
+    Activity =
+        lists:foldl(
+          fun (Id, Activity1) ->
+                  PA = find_member_or_blank(Id, MembersState),
+                  PALeft = find_member_or_blank(Id, MembersStateLeft),
+                  case is_member_alias(Id, Self, View) of
+                      true ->
+                          {_AcksInFlight, Pubs, _PA1} =
+                              find_prefix_common_suffix(PALeft, PA),
+                          activity_cons(Id, pubs_from_queue(Pubs), [],
+                                        Activity1);
+                      false ->
+                          {Acks, _Common, Pubs} =
+                              find_prefix_common_suffix(PA, PALeft),
+                          activity_cons(Id, pubs_from_queue(Pubs),
+                                        acks_from_queue(Acks), Activity1)
+                  end
+          end, activity_nil(), AllMembers),
+    %%io:format("~p received catchup and calculated ~p~n", [Self, activity_finalise(Activity)]),
+    handle_msg({activity, Left, activity_finalise(Activity)}, State);
+
+handle_msg({catchup, _NotLeft, _MembersState}, State) ->
+    State;
+
+handle_msg({activity, Left, Activity},
+           State = #state { self          = Self,
+                            left          = {Left, _MRefL},
+                            view          = View,
+                            members_state = MembersState })
+  when MembersState =/= undefined ->
+%%    io:format("~p received activity ~p~n", [Self, Activity]),
+    {MembersState1, Activity1} =
+        lists:foldl(
+          fun ({Id, Pubs, Acks}, MembersStateActivity) ->
+                  with_member_acc(
+                    fun (PA, Activity2) ->
+                            case is_member_alias(Id, Self, View) of
+                                true ->
+                                    {ToAck, PA1} =
+                                        find_common(
+                                          queue:from_list(Pubs), PA,
+                                                  queue:new()),
+                                    {PA1, activity_cons(
+                                            Id, [], acks_from_queue(ToAck),
+                                            Activity2)};
+                                false ->
+                                    {apply_acks(Acks, join_pubs(PA, Pubs)),
+                                     activity_cons(Id, Pubs, Acks, Activity2)}
+                            end
+                    end, Id, MembersStateActivity)
+          end, {MembersState, activity_nil()}, Activity),
+    State1 = State #state { members_state = MembersState1 },
+    ok = maybe_send_activity(Activity1, State1),
+    State1;
+
+handle_msg({activity, _NotLeft, _Activity}, State) ->
+    State.
+
+
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
             State = #state { left       = Left,
                              right      = Right,
@@ -356,46 +408,133 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
     Member = case {Left, Right} of
                  {{Member1, MRef}, _} -> Member1;
                  {_, {Member1, MRef}} -> Member1;
-                 _                    -> unknown
+                 _                    -> undefined
              end,
-    Group = #gm_group {} =
-        case Member of
-            unknown -> read_group(GroupName);
-            _       -> delete_member_from_group(Member, GroupName)
-        end,
-    noreply(check_neighbours(Group, State)).
+    case Member of
+        undefined ->
+            noreply(State);
+        _ ->
+            View =
+                group_to_view(record_dead_member_in_group(Member, GroupName)),
+            noreply(check_neighbours(State #state { view = View }))
+    end.
+
 
 terminate(normal, _State) ->
     ok;
 terminate(Reason, State) ->
-    io:format("~p died~nreason: ~p~nstate: ~p~n", [self(), Reason, State]),
+    io:format("~p died~n~p~nreason: ~p~nstate: ~p~n",
+              [self(), read_group(State#state.group_name), Reason, State]),
     ok.
+
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-noreply(State) ->
+
+noreply(State = #state { self = Self,
+                         left = {Left, _MRefL},
+                         view = View }) ->
+    #view_member { left = Left } = fetch_view_member(Self, View), %% ASSERTION
     {noreply, State, hibernate}.
 
 reply(Reply, State) ->
     {reply, Reply, State, hibernate}.
 
 %% ---------------------------------------------------------------------------
-%% Group membership management - Link Layer
+%% View construction and inspection
 %% ---------------------------------------------------------------------------
 
-find_neighbours(#gm_group { members = Members }, Self) ->
-    find_neighbours1(queue:from_list(Members), Self).
+needs_view_update(ReqVer, {Ver, _View}) ->
+    Ver < ReqVer.
 
-find_neighbours1(Q, Self) ->
-    case queue:out(Q) of
-        {{value, Self}, Q1} ->
-            {{value, Left}, _Q2} = queue:out_r(Q),
-            {{value, Right}, _Q3} = queue:out(queue:in(Self, Q1)),
-            {Left, Right};
-        {{value, Other}, Q1} ->
-            find_neighbours1(queue:in(Other, Q1), Self)
+view_version({Ver, _View}) ->
+    Ver.
+
+is_member_alive({dead, _Member}) -> false;
+is_member_alive(_)               -> true.
+
+is_member_dead(Member) -> not is_member_alive(Member).
+
+is_member_alias(Self, Self, _View) ->
+    true;
+is_member_alias(Member, Self, View) ->
+    sets:is_element(Member,
+                    ((fetch_view_member(Self, View)) #view_member.aliases)).
+
+dead_member_id({dead, Member}) -> Member.
+
+store_view_member(VMember = #view_member { id = Id }, {Ver, View}) ->
+    {Ver, dict:store(Id, VMember, View)}.
+
+with_view_member(Fun, View, Id) ->
+    store_view_member(Fun(fetch_view_member(Id, View)), View).
+
+fetch_view_member(Id, {_Ver, View}) ->
+    dict:fetch(Id, View).
+
+find_view_member(Id, {_Ver, View}) ->
+    dict:find(Id, View).
+
+blank_view(Ver) ->
+    {Ver, dict:new()}.
+
+group_to_view(#gm_group { members = Members, version = Ver }) ->
+    Alive = lists:filter(fun is_member_alive/1, Members),
+    [_|_] = Alive, %% ASSERTION - can't have all dead members
+    add_aliases(link_view(Alive ++ Alive ++ Alive, blank_view(Ver)), Members).
+
+link_view([Left, Middle, Right | Rest], View) ->
+    case find_view_member(Middle, View) of
+        error ->
+            link_view(
+              [Middle, Right | Rest],
+              store_view_member(#view_member { id      = Middle,
+                                               aliases = sets:new(),
+                                               left    = Left,
+                                               right   = Right }, View));
+        {ok, _} ->
+            View
+    end;
+link_view(_, View) ->
+    View.
+
+add_aliases(View, Members) ->
+    Members1 = ensure_alive_suffix(Members),
+    {EmptyDeadSet, View1} =
+        lists:foldl(
+          fun (Member, {DeadAcc, ViewAcc}) ->
+                  case is_member_alive(Member) of
+                      true ->
+                          {sets:new(),
+                           with_view_member(
+                             fun (VMember =
+                                      #view_member { aliases = Aliases }) ->
+                                     VMember #view_member {
+                                       aliases = sets:union(Aliases, DeadAcc) }
+                             end, ViewAcc, Member)};
+                      false ->
+                          {sets:add_element(dead_member_id(Member), DeadAcc),
+                           ViewAcc}
+                  end
+          end, {sets:new(), View}, Members1),
+    0 = sets:size(EmptyDeadSet), %% ASSERTION
+    View1.
+
+ensure_alive_suffix(Members) ->
+    lists:reverse(queue:to_list(ensure_alive_prefix(
+                                  queue:from_list(lists:reverse(Members))))).
+
+ensure_alive_prefix(MembersQ) ->
+    {{value, Member}, MembersQ1} = queue:out(MembersQ),
+    case is_member_alive(Member) of
+        true  -> MembersQ;
+        false -> ensure_alive_prefix(queue:in(Member, MembersQ1))
     end.
+
+%% ---------------------------------------------------------------------------
+%% View modification
+%% ---------------------------------------------------------------------------
 
 read_group(GroupName) ->
     case mnesia:dirty_read(?GROUP_TABLE, GroupName) of
@@ -403,372 +542,110 @@ read_group(GroupName) ->
         [Group] -> Group
     end.
 
-delete_member_from_group(Member, GroupName) ->
+record_dead_member_in_group(Member, GroupName) ->
     {atomic, Group} =
         mnesia:sync_transaction(
-          fun () -> [Group = #gm_group { members = Members }] =
+          fun () -> [Group = #gm_group { members = Members, version = Ver }] =
                         mnesia:read(?GROUP_TABLE, GroupName),
-                    case lists:delete(Member, Members) of
-                        Members  -> Group;
-                        Members1 -> Group1 =
-                                        Group #gm_group { members = Members1 },
-                                    mnesia:write(Group1),
-                                    Group1
+                    case lists:splitwith(
+                           fun (Member1) -> Member1 =/= Member end, Members) of
+                        {_Members1, []} -> %% not found - already recorded dead
+                            Group;
+                        {Members1, [Member | Members2]} ->
+                            Members3 = Members1 ++ [{dead, Member} | Members2],
+                            Group1 = Group #gm_group { members = Members3,
+                                                       version = Ver + 1 },
+                            mnesia:write(Group1),
+                            Group1
                     end
           end),
     Group.
 
-join_group_internal(Self, GroupName) ->
+record_new_member_in_group(Member, GroupName) ->
     {atomic, Group} =
         mnesia:sync_transaction(
           fun () ->
                   Group1 =
                       case mnesia:read(?GROUP_TABLE, GroupName) of
-                          [Group2 = #gm_group { members = [_|_] = Members }] ->
-                              {A, B} =
-                                  lists:split(
-                                    random:uniform(length(Members)) - 1,
-                                    Members),
-                              Group2 #gm_group { members = A ++ [Self | B] };
+                          [Group2 = #gm_group { members = [_|_] = Members,
+                                                version = Ver }] ->
+                              %% we must join directly after something
+                              %% that's alive.
+                              {DeadPrefix, [Alive | Tail]} =
+                                  lists:splitwith(
+                                    fun is_member_dead/1, Members),
+                              Members1 = DeadPrefix ++ [Alive, Member | Tail],
+                              Group2 #gm_group { members = Members1,
+                                                 version = Ver + 1 };
                           _ ->
                               #gm_group { name    = GroupName,
-                                          members = [Self] }
+                                          members = [Member],
+                                          version = 0 }
                       end,
                   mnesia:write(Group1),
                   Group1
           end),
     Group.
 
+ensure_neighbour(_Ver, Self, {Self, undefined}, Self) ->
+    {Self, undefined};
+ensure_neighbour(Ver, Self, {Self, undefined}, RealNeighbour) ->
+    ok = gen_server2:cast(RealNeighbour, {?TAG, Ver, check_neighbours}),
+    {RealNeighbour, maybe_monitor(RealNeighbour, Self)};
+ensure_neighbour(_Ver, _Self, {RealNeighbour, MRef}, RealNeighbour) ->
+    {RealNeighbour, MRef};
+ensure_neighbour(Ver, Self, {RealNeighbour, MRef}, Neighbour) ->
+    true = erlang:demonitor(MRef),
+    Msg = {?TAG, Ver, check_neighbours},
+    ok = gen_server2:cast(RealNeighbour, Msg),
+    ok = case Neighbour of
+             Self -> ok;
+             _    -> gen_server2:cast(Neighbour, Msg)
+         end,
+    {Neighbour, maybe_monitor(Neighbour, Self)}.
+
 maybe_monitor(Self, Self) ->
     undefined;
 maybe_monitor(Other, _Self) ->
     erlang:monitor(process, Other).
 
-ensure_neighbour(Self, {Self, undefined}, Self) ->
-    {Self, undefined};
-ensure_neighbour(Self, {Self, undefined}, RealNeighbour) ->
-    ok = gen_server2:cast(RealNeighbour, check_neighbours),
-    {RealNeighbour, maybe_monitor(RealNeighbour, Self)};
-ensure_neighbour(_Self, {RealNeighbour, MRef}, RealNeighbour) ->
-    {RealNeighbour, MRef};
-ensure_neighbour(Self, {RealNeighbour, MRef}, Neighbour) ->
-    true = erlang:demonitor(MRef),
-    ok = gen_server2:cast(RealNeighbour, check_neighbours),
-    case Neighbour of
-        Self -> {Self, undefined};
-        _    -> ok = gen_server2:cast(Neighbour, check_neighbours),
-                {Neighbour, maybe_monitor(Neighbour, Self)}
-    end.
+check_neighbours(State = #state { self          = Self,
+                                  left          = Left,
+                                  right         = Right,
+                                  view          = View,
+                                  members_state = MembersState,
+                                  pending_join  = PendingJoin }) ->
+    #view_member { left = VLeft, right = VRight }
+        = fetch_view_member(Self, View),
+    Ver = view_version(View),
+    Left1 = ensure_neighbour(Ver, Self, Left, VLeft),
+    Right1 = ensure_neighbour(Ver, Self, Right, VRight),
+    {MembersState1, PendingJoin1} =
+        case {Left1, Right1} of
+            {{Self, undefined}, {Self, undefined}} ->
+                {blank_member_state(), queue:new()};
+            _ ->
+                {MembersState, PendingJoin}
+        end,
+    State1 = State #state { left = Left1, right = Right1,
+                            members_state = MembersState1,
+                            pending_join  = PendingJoin1 },
+    ok = maybe_send_catchup(Right, State1),
+    State1.
 
-check_neighbours(Group = #gm_group {},
-                 State = #state { self      = Self,
-                                  left      = Left,
-                                  right     = Right }) ->
-    {Left1, Right1} = find_neighbours(Group, Self),
-    Left2 = ensure_neighbour(Self, Left, Left1),
-    Right2 = ensure_neighbour(Self, Right, Right1),
-    %% io:format("~p >--> ~p >--> ~p~n", [Left1, Self, Right1]),
-    State #state { left = Left2, right = Right2 }.
-
-%% ---------------------------------------------------------------------------
-%% View
-%% ---------------------------------------------------------------------------
-
-group_to_view(#gm_group { members = Members }) ->
-    group_to_view(Members ++ Members ++ Members, dict:new()).
-
-group_to_view([Left, Self, Right | Rest], View) ->
-    case dict:find(Self, View) of
-        error ->
-            group_to_view(
-              [Self, Right | Rest],
-              store_view_member(#view_member { id      = Self,
-                                               aliases = sets:new(),
-                                               left    = Left,
-                                               right   = Right }, View));
-        {ok, _} ->
-            View
-    end;
-group_to_view(_, View) ->
-    View.
-
-store_view_members(Members, View) ->
-    lists:foldl(fun store_view_member/2, View, Members).
-
-store_view_member(Member = #view_member { id = Id }, View) ->
-    View1 = dict:store(Id, Member, View),
-    Key = {requires, Id},
-    case dict:find(Key, View1) of
-        error      -> View1;
-        {ok, Msgs} -> process_view_msgs1(Msgs, dict:erase(Key, View1))
-    end.
-
-find_members_inclusive(Start, End, View) ->
-    find_members_inclusive(View, Start, End, []).
-
-find_members_inclusive(View, End, End, Acc) ->
-    [dict:fetch(End, View) | Acc];
-find_members_inclusive(View, Start, End, Acc) ->
-    Member = #view_member { right = Right } = dict:fetch(Start, View),
-    find_members_inclusive(View, Right, End, [Member | Acc]).
-
-view_successor(Id, View) ->
-    (dict:fetch(Id, View)) #view_member.right.
-
-view_fetch(Id, View) ->
-    dict:fetch(Id, View).
-
-is_alive(Id, View) ->
-    case view_fetch(Id, View) of
-        #view_member {} -> true;
-        _               -> false
-    end.
-
-freshen_view(From, To, Msgs, State = #state { self          = Self,
-                                              right         = {Right, _MRef},
-                                              view          = View,
-                                              members_state = MembersState }) ->
-    %% First, process all explicit view alterations. Idempotent.
-    View1 = process_view_msgs(Msgs, View),
-    %% Now try to detect anything else that may have happened: new
-    %% aliases which affect our subsequent handling.
-    {Deaths, View2} = update_view(From, To, Self, View1),
-    %% Detect if our Right has changed, and if so send it a catch_up:
-    RightOld = view_successor(Self, View),
-    case view_successor(Self, View2) of
-        RightOld ->
-            ok;
-        RightNew when Right =/= Self ->
-            gen_server2:cast(Right,
-                             {catch_up, Self, RightNew, MembersState, View2})
-    end,
-    io:format("~s~n", [draw_view(Self, View2)]),
-    %% Now send out any deaths we detected
-    internal_broadcast([{?TAG, {death_of, Id}} || Id <- Deaths],
-                       State #state { view = View2 }).
-
-update_view(From, Self, Self, View) ->
-    %% The sender was sure it was sending to us, so therefore it has
-    %% been told about any changes that have happened.
-    {[],
-     case dict:fetch(Self, View) of
-         #view_member { left = From } ->
-             View;
-         #view_member { left = Left, aliases = Aliases } = MemberSelf ->
-             %% "From" is sure I'm after it. But it may be aware of
-             %% births and deaths I'm not.
-             case dict:find(From, View) of
-                 error ->
-                     %% If I don't know anything about From, then all
-                     %% I can do is assume it's a new node to my left,
-                     %% and I'll process deletions later.
-                     case Left of
-                         Self ->
-                             MemberSelf1 =
-                                 MemberSelf #view_member { left  = From,
-                                                           right = From },
-                             MemberFrom = #view_member { id      = From,
-                                                         aliases = sets:new(),
-                                                         left    = Self,
-                                                         right   = Self },
-                             store_view_members(
-                               [MemberFrom, MemberSelf1], View);
-                         _ ->
-                             #view_member { right = Self } = MemberLeft =
-                                 dict:fetch(Left, View),
-                             MemberSelf1 =
-                                 MemberSelf #view_member { left = From },
-                             MemberLeft1 =
-                                 MemberLeft #view_member { right = From },
-                             MemberFrom = #view_member { id      = From,
-                                                         aliases = sets:new(),
-                                                         left    = Left,
-                                                         right   = Self },
-                             store_view_members(
-                               [MemberFrom, MemberLeft1, MemberSelf1], View)
-                     end;
-                 {ok, #view_member { right = Right } = MemberLeft}
-                   when Right =/= Self ->
-                     %% We're likely, in the future, to be told the
-                     %% following have died...
-                     Dead = find_members_inclusive(Right, Left, View),
-                     io:format("~p suspecting death (A) of ~p~n", [Self, Dead]),
-                     {Aliases1, View1} =
-                         become_aliases(Self, Dead, Aliases, View),
-                     MemberSelf1 =
-                         MemberSelf #view_member { left = From,
-                                                   aliases = Aliases1 },
-                     MemberLeft1 =
-                         MemberLeft #view_member { right = Self },
-                     store_view_members(
-                       [MemberLeft1, MemberSelf1], View1)
-             end
-     end};
-update_view(From, To, Self, View) ->
-    %% The sender didn't realise we're on its right.
-    case dict:fetch(Self, View) of
-        #view_member { left = From, aliases = Aliases } ->
-            %% No problem - it's either not received our birth yet; or
-            %% it's not received notification of deaths of
-            %% intermediates yet. Thus:
-            true = ((dict:fetch(From, View)) #view_member.right =:= Self)
-                orelse sets:is_element(To, Aliases), %% ASSERTION
-            %% However, if we can't find the To at all, it suggests it
-            %% died before we joined and as our upstream hasn't
-            %% noticed its death, we could well be responsible for
-            %% sending out the death notification.
-            {case dict:find(To, View) of
-                 error   -> [To];
-                 {ok, _} -> []
-             end, View};
-        #view_member { left = Left, aliases = Aliases } = MemberSelf ->
-            case dict:find(From, View) of
-                error ->
-                    %% Looks like the new left is a new birth which
-                    %% we're yet to hear about, and some deaths have
-                    %% happened between it and us. Until we receive
-                    %% the birth message from it, there's nothing we
-                    %% can safely do.
-                    {[], View};
-                {ok, #view_member { right = Right } = MemberLeft} ->
-                    %% Neither us, or our new mystery Left, expected
-                    %% this to happen. Thus we need to detect deaths
-                    %% on the left and broadcast them.
-                    Dead = find_members_inclusive(Right, Left, View),
-                    io:format("~p suspecting death (B) of ~p (from ~p to ~p) (~s)~n", [Self, Dead, Right, Left, draw_view(Self, View)]),
-                    {Aliases1, View1} =
-                        become_aliases(Self, Dead, Aliases, View),
-                    MemberSelf1 =
-                        MemberSelf #view_member { left    = From,
-                                                  aliases = Aliases1 },
-                    MemberLeft1 = MemberLeft #view_member { right = Self },
-                    {[Member #view_member.id || Member <- Dead],
-                     store_view_members([MemberLeft1, MemberSelf1], View1)}
-            end
-    end.
-
-become_aliases(Owner, Members, Aliases, View) ->
-    lists:foldl(
-      fun (#view_member { id = Id, aliases = Ids },
-           {AliasesAcc, ViewAcc}) ->
-              {sets:union(Ids, sets:add_element(Id, AliasesAcc)),
-               dict:store(Id, {alias_of, Owner}, ViewAcc)}
-      end, {Aliases, View}, Members).
-
-%% we only need to use resolve_member for Ids that come in from
-%% messages: we guarantee that within our own view, left and right
-%% links will never point to alias_of entries.
-resolve_member(Id, View) ->
-    case dict:find(Id, View) of
-        error                          -> error;
-        {ok, {alias_of, Id1}}          -> resolve_member(Id1, View);
-        {ok, #view_member {} = Member} -> Member
-    end.
-
-is_alias_of(Id, #view_member { id = Id }) ->
-    true;
-is_alias_of(Id, #view_member { aliases = Aliases }) ->
-    sets:is_element(Id, Aliases).
-
-process_view_msgs(Msgs, View) ->
-    lists:foldl(fun ({_From, Pubs, _Acks}, ViewAcc) ->
-                        process_view_msgs1(Pubs, ViewAcc)
-                end, View, Msgs).
-
-%% Things we get guaranteed:
-%% 1. We'll get a birth message before we see any other messages from that member
-%% 2. We'll get a birth message before a death message of the same member
-process_view_msgs1(Pubs, View) ->
-    lists:foldl(
-      fun ({_PubNum, {?TAG, {birth_of, Id, Right}} = Birth}, ViewAcc) ->
-              io:format("~p birth_of ~p (--> ~p)~n", [self(), Id, Right]),
-              case resolve_member(Id, View) of
-                  error ->
-                      case resolve_member(Right, ViewAcc) of
-                          error ->
-                              %% Sadly, there's the possibility that
-                              %% we don't know about the Right: Id
-                              %% knew of Right when it joined, but
-                              %% we're yet to be told about it.
-                              io:format("~p lacking any knowledge of ~p~n", [self(), Right]),
-                              dict_cons({requires, Right}, Birth, ViewAcc);
-                          #view_member { id = Self, left = Self, right = Self } =
-                          MemberSelf ->
-                              MemberNew = #view_member { id      = Id,
-                                                         aliases = sets:new(),
-                                                         left    = Self,
-                                                         right   = Self },
-                              MemberSelf1 =
-                                  MemberSelf #view_member { left = Id,
-                                                            right = Id },
-                              store_view_members(
-                                [MemberNew, MemberSelf1], ViewAcc);
-                          #view_member { id = Right1, left = Left1 } =
-                          MemberRight ->
-                              %% if Right's already died, the correct
-                              %% thing to do is to put our new member
-                              %% on the left of whoever inherited
-                              %% Right.
-                              #view_member { right = Right1 } =
-                                  MemberLeft = dict:fetch(Left1, ViewAcc),
-                              MemberNew = #view_member { id      = Id,
-                                                         aliases = sets:new(),
-                                                         left    = Left1,
-                                                         right   = Right1 },
-                              MemberLeft1 = MemberLeft #view_member { right = Id },
-                              MemberRight1 = MemberRight #view_member { left = Id },
-                              store_view_members(
-                                [MemberLeft1, MemberNew, MemberRight1], ViewAcc)
-                      end;
-                  #view_member {} ->
-                      ViewAcc
-              end;
-          ({_PubNum, {?TAG, {death_of, Id}}}, ViewAcc) ->
-              io:format("~p death_of ~p~n", [self(), Id]),
-              case dict:fetch(Id, ViewAcc) of
-                  {alias_of, _Id} ->
-                      ViewAcc;
-                  #view_member { left = Self, right = Self } = MemberDead ->
-                      #view_member { aliases = Aliases } = MemberSelf =
-                          dict:fetch(Self, ViewAcc),
-                      {Aliases1, ViewAcc1} =
-                          become_aliases(Self, [MemberDead], Aliases, ViewAcc),
-                      MemberSelf1 =
-                          MemberSelf #view_member { left = Self,
-                                                    right = Self,
-                                                    aliases = Aliases1 },
-                      store_view_member(MemberSelf1, ViewAcc1);
-                  #view_member { left = Left, right = Right } = MemberDead ->
-                      #view_member { aliases = Aliases } = MemberRight =
-                          dict:fetch(Right, ViewAcc),
-                      #view_member {} = MemberLeft = dict:fetch(Left, ViewAcc),
-                      {Aliases1, ViewAcc1} =
-                          become_aliases(Right, [MemberDead], Aliases, ViewAcc),
-                      MemberRight1 =
-                          MemberRight #view_member { left = Left,
-                                                     aliases = Aliases1 },
-                      MemberLeft1 =
-                          MemberLeft #view_member { right = Right },
-                      store_view_members([MemberLeft1, MemberRight1], ViewAcc1)
-              end;
-          (_Msg, ViewAcc) ->
-              ViewAcc
-      end, View, Pubs).
-
-dict_cons(Key, Value, Dict) ->
-    dict:update(Key, fun (List) -> [Value | List] end, [Value], Dict).
-
-draw_view(Id, View) ->
-    draw_view(View, Id, draw_member(View, Id, [])).
-
-draw_view(_View, Stop, {Stop, Acc}) ->
-    lists:flatten(Acc ++ io_lib:format("~p", [Stop]));
-draw_view(View, Stop, {Id, Acc}) ->
-    draw_view(View, Stop, draw_member(View, Id, Acc)).
-
-draw_member(View, Id, Acc) ->
-    #view_member { right = Right, aliases = Aliases } = view_fetch(Id, View),
-    {Right, Acc ++ io_lib:format("(~p ~p) -> ", [Id, sets:to_list(Aliases)])}.
+maybe_send_catchup(Right, #state { right = Right }) ->
+    ok;
+maybe_send_catchup(_Right, #state { self  = Self,
+                                    right = {Self, undefined} }) ->
+    ok;
+maybe_send_catchup(_Right, #state { members_state = undefined }) ->
+    ok;
+maybe_send_catchup(_Right, #state { self          = Self,
+                                    right         = {Right, _MRef},
+                                    view          = View,
+                                    members_state = MembersState }) ->
+    gen_server2:cast(Right, {?TAG, view_version(View),
+                             {catchup, Self, MembersState}}).
 
 %% ---------------------------------------------------------------------------
 %% Catch_up delta detection
@@ -838,57 +715,70 @@ store_member(Id, Member, MembersState) ->
 %% Activity assembly
 %% ---------------------------------------------------------------------------
 
-output_nil() ->
+activity_nil() ->
     queue:new().
 
-output_cons(_Id, [], [], Tail) ->
+activity_cons(_Id, [], [], Tail) ->
     Tail;
-output_cons(Sender, Pubs, Acks, Tail) ->
+activity_cons(Sender, Pubs, Acks, Tail) ->
     queue:in({Sender, Pubs, Acks}, Tail).
 
-output_finalise(Activity) ->
+activity_finalise(Activity) ->
     queue:to_list(Activity).
 
-internal_broadcast(Msgs, State = #state { self          = Self,
-                                          right         = Right,
-                                          view          = View,
-                                          pub_count     = PubCount,
-                                          members_state = MembersState }) ->
-    {PubMsgs, PubCount1} =
-        lists:foldr(
-          fun (Msg, {PubMsgsAcc, PubCountAcc}) ->
-                  {[{PubCountAcc, Msg} | PubMsgsAcc], PubCountAcc + 1}
-          end, {[], PubCount}, Msgs),
-    MembersState1 =
-        case send_right(Self, View, Right,
-                        output_cons(Self, PubMsgs, [], output_nil())) of
-            true ->
-                with_member(
-                  fun (PA) -> queue:join(PA, queue:from_list(PubMsgs)) end,
-                  Self, MembersState);
-            false ->
-                MembersState
-        end,
-    State #state { members_state = MembersState1, pub_count = PubCount1 }.
-
-send_right(Self, _View, {Self, undefined}, _Output) ->
-    false;
-send_right(Self, View, {Right, _MRef}, Output) ->
-    case queue:is_empty(Output) of
-        true  -> false;
-        false -> ok = gen_server2:cast(
-                        Right,
-                        {activity, {Self, view_successor(Self, View),
-                                    output_finalise(Output)}}),
-                 true
+maybe_send_activity(Activity, #state { self  = Self,
+                                       right = {Right, _MRefR},
+                                       view  = View }) ->
+    case activity_finalise(Activity) of
+        []        -> ok;
+        Activity1 -> gen_server2:cast(
+                       Right,
+                       {?TAG, view_version(View), {activity, Self, Activity1}})
     end.
+
+%% internal_broadcast(Msgs, State = #state { self          = Self,
+%%                                           right         = Right,
+%%                                           view          = View,
+%%                                           pub_count     = PubCount,
+%%                                           members_state = MembersState }) ->
+%%     {PubMsgs, PubCount1} =
+%%         lists:foldr(
+%%           fun (Msg, {PubMsgsAcc, PubCountAcc}) ->
+%%                   {[{PubCountAcc, Msg} | PubMsgsAcc], PubCountAcc + 1}
+%%           end, {[], PubCount}, Msgs),
+%%     MembersState1 =
+%%         case send_right(Self, View, Right,
+%%                         output_cons(Self, PubMsgs, [], output_nil())) of
+%%             true ->
+%%                 with_member(
+%%                   fun (PA) -> queue:join(PA, queue:from_list(PubMsgs)) end,
+%%                   Self, MembersState);
+%%             false ->
+%%                 MembersState
+%%         end,
+%%     State #state { members_state = MembersState1, pub_count = PubCount1 }.
+
+%% send_right(Self, _View, {Self, undefined}, _Output) ->
+%%     false;
+%% send_right(Self, View, {Right, _MRef}, Output) ->
+%%     case queue:is_empty(Output) of
+%%         true  -> false;
+%%         false -> ok = gen_server2:cast(
+%%                         Right,
+%%                         {activity, {Self, view_successor(Self, View),
+%%                                     output_finalise(Output)}}),
+%%                  true
+%%     end.
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
 %% ---------------------------------------------------------------------------
 
-acks_from_queue(Pubs) ->
-    [PubNum || {PubNum, _Msg} <- queue:to_list(Pubs)].
+acks_from_queue(Q) ->
+    [PubNum || {PubNum, _Msg} <- queue:to_list(Q)].
+
+pubs_from_queue(Q) ->
+    queue:to_list(Q).
 
 apply_acks([], Pubs) ->
     Pubs;
