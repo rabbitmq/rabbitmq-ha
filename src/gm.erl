@@ -704,8 +704,14 @@ blank_member() ->
 blank_member_state() ->
     dict:new().
 
-store_member(Id, Member, MembersState) ->
-    dict:store(Id, Member, MembersState).
+is_blank_member_state(MemberState) ->
+    queue:is_empty(MemberState).
+
+store_member(Id, MemberState, MembersState) ->
+    case is_blank_member_state(MemberState) of
+        true  -> dict:erase(Id, MembersState);
+        false -> dict:store(Id, MemberState, MembersState)
+    end.
 
 
 %% ---------------------------------------------------------------------------
