@@ -288,10 +288,8 @@ handle_cast({broadcast, Msg},
                              pub_count     = PubCount,
                              members_state = MembersState }) ->
     PubMsg = {PubCount, Msg},
-    Activity =
-        activity_finalise(activity_cons(Self, [PubMsg], [], activity_nil())),
-    ok = gen_server2:cast(Right, {?TAG, view_version(View),
-                                  {activity, Self, Activity}}),
+    Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
+    ok = send_activity(Self, Right, View, Activity),
     MembersState1 =
         with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, MembersState),
     noreply(State #state { members_state = MembersState1,
@@ -317,17 +315,13 @@ handle_msg({catchup, Left, MembersStateLeft},
                             view          = View,
                             members_state = undefined,
                             pending_join  = PendingJoin }) ->
-    ok = gen_server2:cast(Right, {?TAG, view_version(View),
-                                  {catchup, Self, MembersStateLeft}}),
-    %%io:format("~p fully joined~n", [Self]),
+    ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
     case queue:to_list(PendingJoin) of
         [] ->
             State #state { members_state = MembersStateLeft };
         Pubs ->
-            Activity = activity_finalise(
-                         activity_cons(Self, Pubs, [], activity_nil())),
-            ok = gen_server2:cast(Right, {?TAG, view_version(View),
-                                          {activity, Self, Activity}}),
+            Activity = activity_cons(Self, Pubs, [], activity_nil()),
+            ok = send_activity(Self, Right, View, Activity),
             MembersState1 = with_member(fun (_PA) -> PendingJoin end, Self,
                                         MembersStateLeft),
             State #state { members_state = MembersState1,
@@ -360,7 +354,6 @@ handle_msg({catchup, Left, MembersStateLeft},
                                         acks_from_queue(Acks), Activity1)
                   end
           end, activity_nil(), AllMembers),
-    %%io:format("~p received catchup and calculated ~p~n", [Self, activity_finalise(Activity)]),
     handle_msg({activity, Left, activity_finalise(Activity)}, State);
 
 handle_msg({catchup, _NotLeft, _MembersState}, State) ->
@@ -372,7 +365,6 @@ handle_msg({activity, Left, Activity},
                             view          = View,
                             members_state = MembersState })
   when MembersState =/= undefined ->
-%%    io:format("~p received activity ~p~n", [Self, Activity]),
     {MembersState1, Activity1} =
         lists:foldl(
           fun ({Id, Pubs, Acks}, MembersStateActivity) ->
@@ -381,9 +373,8 @@ handle_msg({activity, Left, Activity},
                             case is_member_alias(Id, Self, View) of
                                 true ->
                                     {ToAck, PA1} =
-                                        find_common(
-                                          queue:from_list(Pubs), PA,
-                                                  queue:new()),
+                                        find_common(queue_from_pubs(Pubs), PA,
+                                                    queue:new()),
                                     {PA1, activity_cons(
                                             Id, [], acks_from_queue(ToAck),
                                             Activity2)};
@@ -438,8 +429,6 @@ noreply(State = #state { self = Self,
     #view_member { left = Left } = fetch_view_member(Self, View), %% ASSERTION
     {noreply, State, hibernate}.
 
-reply(Reply, State) ->
-    {reply, Reply, State, hibernate}.
 
 %% ---------------------------------------------------------------------------
 %% View construction and inspection
@@ -522,15 +511,15 @@ add_aliases(View, Members) ->
     View1.
 
 ensure_alive_suffix(Members) ->
-    lists:reverse(queue:to_list(ensure_alive_prefix(
-                                  queue:from_list(lists:reverse(Members))))).
+    queue:to_list(ensure_alive_suffix1(queue:from_list(Members))).
 
-ensure_alive_prefix(MembersQ) ->
-    {{value, Member}, MembersQ1} = queue:out(MembersQ),
+ensure_alive_suffix1(MembersQ) ->
+    {{value, Member}, MembersQ1} = queue:out_r(MembersQ),
     case is_member_alive(Member) of
         true  -> MembersQ;
-        false -> ensure_alive_prefix(queue:in(Member, MembersQ1))
+        false -> ensure_alive_suffix1(queue:in_r(Member, MembersQ1))
     end.
+
 
 %% ---------------------------------------------------------------------------
 %% View modification
@@ -586,6 +575,11 @@ record_new_member_in_group(Member, GroupName) ->
                   Group1
           end),
     Group.
+
+
+%% ---------------------------------------------------------------------------
+%% View monitoring and maintanence
+%% ---------------------------------------------------------------------------
 
 ensure_neighbour(_Ver, Self, {Self, undefined}, Self) ->
     {Self, undefined};
@@ -644,8 +638,8 @@ maybe_send_catchup(_Right, #state { self          = Self,
                                     right         = {Right, _MRef},
                                     view          = View,
                                     members_state = MembersState }) ->
-    gen_server2:cast(Right, {?TAG, view_version(View),
-                             {catchup, Self, MembersState}}).
+    send_right(Right, View, {catchup, Self, MembersState}).
+
 
 %% ---------------------------------------------------------------------------
 %% Catch_up delta detection
@@ -681,6 +675,7 @@ find_common(A, B, Common) ->
             {Common, B}
     end.
 
+
 %% ---------------------------------------------------------------------------
 %% Members helpers
 %% ---------------------------------------------------------------------------
@@ -711,6 +706,7 @@ blank_member_state() ->
 store_member(Id, Member, MembersState) ->
     dict:store(Id, Member, MembersState).
 
+
 %% ---------------------------------------------------------------------------
 %% Activity assembly
 %% ---------------------------------------------------------------------------
@@ -736,39 +732,12 @@ maybe_send_activity(Activity, #state { self  = Self,
                        {?TAG, view_version(View), {activity, Self, Activity1}})
     end.
 
-%% internal_broadcast(Msgs, State = #state { self          = Self,
-%%                                           right         = Right,
-%%                                           view          = View,
-%%                                           pub_count     = PubCount,
-%%                                           members_state = MembersState }) ->
-%%     {PubMsgs, PubCount1} =
-%%         lists:foldr(
-%%           fun (Msg, {PubMsgsAcc, PubCountAcc}) ->
-%%                   {[{PubCountAcc, Msg} | PubMsgsAcc], PubCountAcc + 1}
-%%           end, {[], PubCount}, Msgs),
-%%     MembersState1 =
-%%         case send_right(Self, View, Right,
-%%                         output_cons(Self, PubMsgs, [], output_nil())) of
-%%             true ->
-%%                 with_member(
-%%                   fun (PA) -> queue:join(PA, queue:from_list(PubMsgs)) end,
-%%                   Self, MembersState);
-%%             false ->
-%%                 MembersState
-%%         end,
-%%     State #state { members_state = MembersState1, pub_count = PubCount1 }.
+send_activity(Self, Right, View, Activity) ->
+    ok = send_right(Right, View, {activity, Self, activity_finalise(Activity)}).
 
-%% send_right(Self, _View, {Self, undefined}, _Output) ->
-%%     false;
-%% send_right(Self, View, {Right, _MRef}, Output) ->
-%%     case queue:is_empty(Output) of
-%%         true  -> false;
-%%         false -> ok = gen_server2:cast(
-%%                         Right,
-%%                         {activity, {Self, view_successor(Self, View),
-%%                                     output_finalise(Output)}}),
-%%                  true
-%%     end.
+send_right(Right, View, Msg) ->
+    ok = gen_server2:cast(Right, {?TAG, view_version(View), Msg}).
+
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
@@ -780,22 +749,16 @@ acks_from_queue(Q) ->
 pubs_from_queue(Q) ->
     queue:to_list(Q).
 
+queue_from_pubs(Pubs) ->
+    queue:from_list(Pubs).
+
 apply_acks([], Pubs) ->
     Pubs;
 apply_acks([PubNum | Acks], Pubs) ->
     {{value, {PubNum, _Msg}}, Pubs1} = queue:out(Pubs),
     apply_acks(Acks, Pubs1).
 
-%% TODO: when everything's right, this should just be queue:join/2
 join_pubs(Q, []) ->
     Q;
-join_pubs(Q, [{Num, _} = Pub | Pubs] = AllPubs) ->
-    case queue:out_r(Q) of
-        {empty, _Q} ->
-            join_pubs(queue:in(Pub, Q), Pubs);
-        {{value, {Num1, _}}, _Q} when Num1 + 1 =:= Num ->
-            join_pubs(queue:in(Pub, Q), Pubs);
-        {{value, {_Num1, _}}, _Q} ->
-            io:format("~p join_pubs(~p, ~p)~n", [self(), queue:to_list(Q), AllPubs]),
-            exit(join_pubs_failure)
-    end.
+join_pubs(Q, Pubs) ->
+    queue:join(Q, queue_from_pubs(Pubs)).
