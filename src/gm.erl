@@ -270,16 +270,15 @@ handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
              end,
     noreply(handle_msg(Msg, State1));
 
-handle_cast({broadcast, Msg}, State = #state { members_state = undefined,
+handle_cast({broadcast, Msg}, State = #state { self          = Self,
+                                               right         = Right,
+                                               members_state = MembersState,
                                                pending_join  = PendingJoin,
-                                               pub_count     = PubCount }) ->
+                                               pub_count     = PubCount })
+  when Right =:= {Self, undefined} orelse MembersState =:= undefined ->
     noreply(
       State #state { pending_join = queue:in({PubCount, Msg}, PendingJoin),
                      pub_count    = PubCount + 1 });
-
-handle_cast({broadcast, _Msg}, State = #state { self  = Self,
-                                                right = {Self, undefined} }) ->
-    noreply(State);
 
 handle_cast({broadcast, Msg},
             State = #state { self          = Self,
