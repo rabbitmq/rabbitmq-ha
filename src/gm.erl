@@ -443,8 +443,6 @@ view_version({Ver, _View}) ->
 is_member_alive({dead, _Member}) -> false;
 is_member_alive(_)               -> true.
 
-is_member_dead(Member) -> not is_member_alive(Member).
-
 is_member_alias(Self, Self, _View) ->
     true;
 is_member_alias(Member, Self, View) ->
@@ -560,10 +558,14 @@ record_new_member_in_group(Member, GroupName) ->
                                                 version = Ver }] ->
                               %% we must join directly after something
                               %% that's alive.
-                              {DeadPrefix, [Alive | Tail]} =
+                              Alive =
+                                  lists:filter(fun is_member_alive/1, Members),
+                              Left = lists:nth(random:uniform(length(Alive)),
+                                               Alive),
+                              {Prefix, [Left | Suffix]} =
                                   lists:splitwith(
-                                    fun is_member_dead/1, Members),
-                              Members1 = DeadPrefix ++ [Alive, Member | Tail],
+                                    fun (M) -> M =/= Left end, Members),
+                              Members1 = Prefix ++ [Left, Member | Suffix],
                               Group2 #gm_group { members = Members1,
                                                  version = Ver + 1 };
                           _ ->
