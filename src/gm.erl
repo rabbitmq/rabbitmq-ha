@@ -200,6 +200,8 @@
 
 -record(view_member, { id, aliases, left, right }).
 
+-record(member, { pending_ack, last_pub, last_ack }).
+
 -define(TAG, '$gm').
 
 -define(TABLES,
@@ -290,7 +292,10 @@ handle_cast({broadcast, Msg},
     Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
     ok = send_activity(Self, Right, View, Activity),
     MembersState1 =
-        with_member(fun (PA) -> queue:in(PubMsg, PA) end, Self, MembersState),
+        with_member(
+          fun (Member = #member { pending_ack = PA }) ->
+                  Member #member { pending_ack = queue:in(PubMsg, PA) }
+          end, Self, MembersState),
     noreply(State #state { members_state = MembersState1,
                            pub_count     = PubCount + 1 });
 
@@ -315,15 +320,18 @@ handle_msg({catchup, Left, MembersStateLeft},
                             members_state = undefined,
                             pending_join  = PendingJoin }) ->
     ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
+    MembersStateLeft1 = build_members_state(MembersStateLeft),
     case queue:to_list(PendingJoin) of
         [] ->
-            State #state { members_state = MembersStateLeft };
+            State #state { members_state = MembersStateLeft1 };
         Pubs ->
             Activity = activity_cons(Self, Pubs, [], activity_nil()),
             ok = send_activity(Self, Right, View, Activity),
-            MembersState1 = with_member(fun (_PA) -> PendingJoin end, Self,
-                                        MembersStateLeft),
-            State #state { members_state = MembersState1,
+            MembersState2 =
+                with_member(fun (Member) ->
+                                    Member #member { pending_ack = PendingJoin }
+                            end, Self, MembersStateLeft1),
+            State #state { members_state = MembersState2,
                            pending_join  = queue:new() }
     end;
 
@@ -333,27 +341,38 @@ handle_msg({catchup, Left, MembersStateLeft},
                             view = View,
                             members_state = MembersState })
   when MembersState =/= undefined ->
+    MembersStateLeft1 = build_members_state(MembersStateLeft),
     AllMembers = lists:usort(dict:fetch_keys(MembersState) ++
-                                 dict:fetch_keys(MembersStateLeft)),
-    Activity =
+                                 dict:fetch_keys(MembersStateLeft1)),
+    {MembersState1, Activity} =
         lists:foldl(
-          fun (Id, Activity1) ->
-                  PA = find_member_or_blank(Id, MembersState),
-                  PALeft = find_member_or_blank(Id, MembersStateLeft),
-                  case is_member_alias(Id, Self, View) of
-                      true ->
-                          {_AcksInFlight, Pubs, _PA1} =
-                              find_prefix_common_suffix(PALeft, PA),
-                          activity_cons(Id, pubs_from_queue(Pubs), [],
-                                        Activity1);
-                      false ->
-                          {Acks, _Common, Pubs} =
-                              find_prefix_common_suffix(PA, PALeft),
-                          activity_cons(Id, pubs_from_queue(Pubs),
-                                        acks_from_queue(Acks), Activity1)
-                  end
-          end, activity_nil(), AllMembers),
-    handle_msg({activity, Left, activity_finalise(Activity)}, State);
+          fun (Id, MembersStateActivity) ->
+                  #member { pending_ack = PALeft, last_ack = LA } =
+                      find_member_or_blank(Id, MembersStateLeft1),
+                  with_member_acc(
+                    fun (#member { pending_ack = PA } = Member, Activity1) ->
+                            case is_member_alias(Id, Self, View) of
+                                true ->
+                                    {_AcksInFlight, Pubs, _PA1} =
+                                        find_prefix_common_suffix(PALeft, PA),
+                                    {Member #member { last_ack = LA },
+                                     activity_cons(Id, pubs_from_queue(Pubs),
+                                                   [], Activity1)};
+                                false ->
+                                    {Acks, _Common, Pubs} =
+                                        find_prefix_common_suffix(PA, PALeft),
+                                    {Member,
+                                     activity_cons(Id, pubs_from_queue(Pubs),
+                                                   acks_from_queue(Acks),
+                                                   Activity1)}
+                            end
+                    end, Id, MembersStateActivity)
+          end, {MembersState, activity_nil()}, AllMembers),
+    State1 = handle_msg({activity, Left, activity_finalise(Activity)},
+                        State #state { members_state = MembersState1 }),
+    %% we can only tidy up when we know we've receive all pubs for
+    %% inherited members
+    maybe_erase_aliases(State1);
 
 handle_msg({catchup, _NotLeft, _MembersState}, State) ->
     State;
@@ -368,17 +387,27 @@ handle_msg({activity, Left, Activity},
         lists:foldl(
           fun ({Id, Pubs, Acks}, MembersStateActivity) ->
                   with_member_acc(
-                    fun (PA, Activity2) ->
+                    fun (Member = #member { pending_ack = PA,
+                                            last_pub    = LP,
+                                            last_ack    = LA }, Activity2) ->
                             case is_member_alias(Id, Self, View) of
                                 true ->
                                     {ToAck, PA1} =
                                         find_common(queue_from_pubs(Pubs), PA,
                                                     queue:new()),
-                                    {PA1, activity_cons(
-                                            Id, [], acks_from_queue(ToAck),
-                                            Activity2)};
+                                    LA1 = last_ack(Acks, LA),
+                                    {Member #member { pending_ack = PA1,
+                                                      last_ack    = LA1 },
+                                     activity_cons(
+                                       Id, [], acks_from_queue(ToAck),
+                                       Activity2)};
                                 false ->
-                                    {apply_acks(Acks, join_pubs(PA, Pubs)),
+                                    PA1 = apply_acks(Acks, join_pubs(PA, Pubs)),
+                                    LA1 = last_ack(Acks, LA),
+                                    LP1 = last_pub(Pubs, LP),
+                                    {Member #member { pending_ack = PA1,
+                                                      last_pub    = LP1,
+                                                      last_ack    = LA1 },
                                      activity_cons(Id, Pubs, Acks, Activity2)}
                             end
                     end, Id, MembersStateActivity)
@@ -531,18 +560,18 @@ read_group(GroupName) ->
 record_dead_member_in_group(Member, GroupName) ->
     {atomic, Group} =
         mnesia:sync_transaction(
-          fun () -> [Group = #gm_group { members = Members, version = Ver }] =
+          fun () -> [Group1 = #gm_group { members = Members, version = Ver }] =
                         mnesia:read(?GROUP_TABLE, GroupName),
                     case lists:splitwith(
                            fun (Member1) -> Member1 =/= Member end, Members) of
                         {_Members1, []} -> %% not found - already recorded dead
-                            Group;
+                            Group1;
                         {Members1, [Member | Members2]} ->
                             Members3 = Members1 ++ [{dead, Member} | Members2],
-                            Group1 = Group #gm_group { members = Members3,
-                                                       version = Ver + 1 },
-                            mnesia:write(Group1),
-                            Group1
+                            Group2 = Group1 #gm_group { members = Members3,
+                                                        version = Ver + 1 },
+                            mnesia:write(Group2),
+                            Group2
                     end
           end),
     Group.
@@ -577,6 +606,54 @@ record_new_member_in_group(Member, GroupName) ->
           end),
     Group.
 
+erase_members_in_group(Members, GroupName) ->
+    DeadMembers = [{dead, Id} || Id <- Members],
+    {atomic, Group} =
+        mnesia:sync_transaction(
+          fun () ->
+                  [Group1 = #gm_group { members = [_|_] = Members1,
+                                        version = Ver }] =
+                      mnesia:read(?GROUP_TABLE, GroupName),
+                  case Members1 -- DeadMembers of
+                      Members1 -> Group1;
+                      Members2 -> Group2 =
+                                      Group1 #gm_group { members = Members2,
+                                                         version = Ver + 1 },
+                                  mnesia:write(Group2),
+                                  Group2
+                  end
+          end),
+    Group.
+
+maybe_erase_aliases(State = #state { self          = Self,
+                                     group_name    = GroupName,
+                                     view          = View,
+                                     members_state = MembersState }) ->
+    #view_member { aliases = Aliases } = fetch_view_member(Self, View),
+    {Erasable, MembersState1}
+        = sets:fold(
+            fun (Id, {ErasableAcc, MembersStateAcc} = Acc) ->
+                    #member { last_pub = LP, last_ack = LA } =
+                        find_member_or_blank(Id, MembersState),
+                    case can_erase_view_member(Self, Id, LA, LP) of
+                        true  -> {[Id | ErasableAcc],
+                                  erase_member(Id, MembersStateAcc)};
+                        false -> Acc
+                    end
+            end, {[], MembersState}, Aliases),
+    case Erasable of
+        [] -> ok;
+        _  -> erase_members_in_group(Erasable, GroupName)
+    end,
+    State #state { members_state = MembersState1 }.
+
+can_erase_view_member(Self, Self, _LA, _LP) ->
+    false;
+can_erase_view_member(_Self, _Id, N, N) ->
+    true;
+can_erase_view_member(_Self, _Id, _LA, _LP) ->
+    false.
+
 
 %% ---------------------------------------------------------------------------
 %% View monitoring and maintanence
@@ -608,23 +685,19 @@ check_neighbours(State = #state { self          = Self,
                                   left          = Left,
                                   right         = Right,
                                   view          = View,
-                                  members_state = MembersState,
-                                  pending_join  = PendingJoin }) ->
+                                  members_state = MembersState }) ->
     #view_member { left = VLeft, right = VRight }
         = fetch_view_member(Self, View),
     Ver = view_version(View),
     Left1 = ensure_neighbour(Ver, Self, Left, VLeft),
     Right1 = ensure_neighbour(Ver, Self, Right, VRight),
-    {MembersState1, PendingJoin1} =
+    MembersState1 =
         case {Left1, Right1} of
-            {{Self, undefined}, {Self, undefined}} ->
-                {blank_member_state(), queue:new()};
-            _ ->
-                {MembersState, PendingJoin}
+            {{Self, undefined}, {Self, undefined}} -> blank_member_state();
+            _                                      -> MembersState
         end,
     State1 = State #state { left = Left1, right = Right1,
-                            members_state = MembersState1,
-                            pending_join  = PendingJoin1 },
+                            members_state = MembersState1 },
     ok = maybe_send_catchup(Right, State1),
     State1.
 
@@ -639,7 +712,8 @@ maybe_send_catchup(_Right, #state { self          = Self,
                                     right         = {Right, _MRef},
                                     view          = View,
                                     members_state = MembersState }) ->
-    send_right(Right, View, {catchup, Self, MembersState}).
+    send_right(Right, View,
+               {catchup, Self, prepare_members_state(MembersState)}).
 
 
 %% ---------------------------------------------------------------------------
@@ -699,19 +773,19 @@ erase_member(Id, MembersState) ->
     dict:erase(Id, MembersState).
 
 blank_member() ->
-    queue:new().
+    #member { pending_ack = queue:new(), last_pub = -1, last_ack = -1 }.
 
 blank_member_state() ->
     dict:new().
 
-is_blank_member_state(MemberState) ->
-    queue:is_empty(MemberState).
-
 store_member(Id, MemberState, MembersState) ->
-    case is_blank_member_state(MemberState) of
-        true  -> dict:erase(Id, MembersState);
-        false -> dict:store(Id, MemberState, MembersState)
-    end.
+    dict:store(Id, MemberState, MembersState).
+
+prepare_members_state(MembersState) ->
+    dict:to_list(MembersState).
+
+build_members_state(MembersStateList) ->
+    dict:from_list(MembersStateList).
 
 
 %% ---------------------------------------------------------------------------
@@ -769,3 +843,17 @@ join_pubs(Q, []) ->
     Q;
 join_pubs(Q, Pubs) ->
     queue:join(Q, queue_from_pubs(Pubs)).
+
+last_ack([], LA) ->
+    LA;
+last_ack(List, LA) ->
+    LA1 = lists:last(List),
+    true = LA1 > LA, %% ASSERTION
+    LA1.
+
+last_pub([], LP) ->
+    LP;
+last_pub(List, LP) ->
+    {PubNum, _Msg} = lists:last(List),
+    true = PubNum > LP, %% ASSERTION
+    PubNum.
