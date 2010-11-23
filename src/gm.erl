@@ -183,6 +183,7 @@
 -define(GROUP_TABLE, gm_group).
 -define(HIBERNATE_AFTER_MIN, 1000).
 -define(DESIRED_HIBERNATE, 10000).
+-define(SETS, ordsets).
 
 -record(state,
         { self,
@@ -502,8 +503,8 @@ is_member_alive(_)               -> true.
 is_member_alias(Self, Self, _View) ->
     true;
 is_member_alias(Member, Self, View) ->
-    sets:is_element(Member,
-                    ((fetch_view_member(Self, View)) #view_member.aliases)).
+    ?SETS:is_element(Member,
+                     ((fetch_view_member(Self, View)) #view_member.aliases)).
 
 dead_member_id({dead, Member}) -> Member.
 
@@ -533,7 +534,7 @@ link_view([Left, Middle, Right | Rest], View) ->
             link_view(
               [Middle, Right | Rest],
               store_view_member(#view_member { id      = Middle,
-                                               aliases = sets:new(),
+                                               aliases = ?SETS:new(),
                                                left    = Left,
                                                right   = Right }, View));
         {ok, _} ->
@@ -549,19 +550,19 @@ add_aliases(View, Members) ->
           fun (Member, {DeadAcc, ViewAcc}) ->
                   case is_member_alive(Member) of
                       true ->
-                          {sets:new(),
+                          {?SETS:new(),
                            with_view_member(
                              fun (VMember =
                                       #view_member { aliases = Aliases }) ->
                                      VMember #view_member {
-                                       aliases = sets:union(Aliases, DeadAcc) }
+                                       aliases = ?SETS:union(Aliases, DeadAcc) }
                              end, ViewAcc, Member)};
                       false ->
-                          {sets:add_element(dead_member_id(Member), DeadAcc),
+                          {?SETS:add_element(dead_member_id(Member), DeadAcc),
                            ViewAcc}
                   end
-          end, {sets:new(), View}, Members1),
-    0 = sets:size(EmptyDeadSet), %% ASSERTION
+          end, {?SETS:new(), View}, Members1),
+    0 = ?SETS:size(EmptyDeadSet), %% ASSERTION
     View1.
 
 ensure_alive_suffix(Members) ->
@@ -699,7 +700,7 @@ maybe_erase_aliases(State = #state { self          = Self,
                                      members_state = MembersState }) ->
     #view_member { aliases = Aliases } = fetch_view_member(Self, View),
     {Erasable, MembersState1}
-        = sets:fold(
+        = ?SETS:fold(
             fun (Id, {ErasableAcc, MembersStateAcc} = Acc) ->
                     #member { last_pub = LP, last_ack = LA } =
                         find_member_or_blank(Id, MembersState),
