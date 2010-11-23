@@ -600,10 +600,8 @@ join_group(Self, GroupName, #gm_group { members = Members } = Group) ->
                     try
                         case gen_server2:call(
                                Left, {add_on_right, Self}, infinity) of
-                            {ok, Group1} ->
-                                group_to_view(Group1);
-                            not_ready ->
-                                join_group(Self, GroupName)
+                            {ok, Group1} -> group_to_view(Group1);
+                            not_ready    -> join_group(Self, GroupName)
                         end
                     catch
                         exit:{R, _} when R =:= noproc; R =:= normal; R =:= shutdown ->
@@ -632,11 +630,9 @@ prune_or_create_group(Self, GroupName) ->
                             GroupNew;
                         [Group1 = #gm_group { members = Members }] ->
                             case lists:any(fun is_member_alive/1, Members) of
-                                true ->
-                                    Group1;
-                                false ->
-                                    mnesia:write(GroupNew),
-                                    GroupNew
+                                true  -> Group1;
+                                false -> mnesia:write(GroupNew),
+                                         GroupNew
                             end
                     end
           end),
