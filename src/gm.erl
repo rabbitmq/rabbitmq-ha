@@ -248,8 +248,24 @@ init([GroupName, Callback]) ->
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 
-handle_call(Msg, _From, State) ->
-    {stop, {unexpected_msg, Msg}, State}.
+handle_call({add_on_right, _NewMember}, _From,
+            State = #state { members_state = undefined }) ->
+    reply(not_ready, State);
+
+handle_call({add_on_right, NewMember}, _From,
+            State = #state { self          = Self,
+                             group_name    = GroupName,
+                             members_state = MembersState }) ->
+    Group = record_new_member_in_group(
+              GroupName, Self, NewMember,
+              fun (Group1) ->
+                      View1 = group_to_view(Group1),
+                      ok = send_right(NewMember, View1,
+                                      {catchup, Self, prepare_members_state(
+                                                        MembersState)})
+              end),
+    View = group_to_view(Group),
+    reply({ok, Group}, check_neighbours(State #state { view = View })).
 
 
 handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
@@ -301,7 +317,7 @@ handle_cast({broadcast, Msg},
 
 handle_cast(join, State = #state { self       = Self,
                                    group_name = GroupName }) ->
-    View = group_to_view(record_new_member_in_group(Self, GroupName)),
+    View = join_group(Self, GroupName),
     noreply(check_neighbours(State #state { view = View }));
 
 handle_cast(leave, State) ->
@@ -454,12 +470,21 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 
-noreply(State = #state { self = Self,
-                         left = {Left, _MRefL},
-                         view = View }) ->
-    #view_member { left = Left } = fetch_view_member(Self, View), %% ASSERTION
+noreply(State) ->
+    ok = a(State),
     {noreply, State, hibernate}.
 
+reply(Reply, State) ->
+    ok = a(State),
+    {reply, Reply, State, hibernate}.
+
+a(#state { view = undefined }) ->
+    ok;
+a(#state { self = Self,
+           left = {Left, _MRefL},
+           view = View }) ->
+    #view_member { left = Left } = fetch_view_member(Self, View),
+    ok.
 
 %% ---------------------------------------------------------------------------
 %% View construction and inspection
@@ -554,11 +579,68 @@ ensure_alive_suffix1(MembersQ) ->
 %% View modification
 %% ---------------------------------------------------------------------------
 
+join_group(Self, GroupName) ->
+    join_group(Self, GroupName, read_group(GroupName)).
+
+join_group(Self, GroupName, {error, not_found}) ->
+    join_group(Self, GroupName, prune_or_create_group(Self, GroupName));
+join_group(Self, _GroupName, #gm_group { members = [Self] } = Group) ->
+    group_to_view(Group);
+join_group(Self, GroupName, #gm_group { members = Members } = Group) ->
+    case lists:member(Self, Members) of
+        true ->
+            group_to_view(Group);
+        false ->
+            case lists:filter(fun is_member_alive/1, Members) of
+                [] ->
+                    join_group(Self, GroupName,
+                               prune_or_create_group(Self, GroupName));
+                Alive ->
+                    Left = lists:nth(random:uniform(length(Alive)), Alive),
+                    try
+                        case gen_server2:call(
+                               Left, {add_on_right, Self}, infinity) of
+                            {ok, Group1} ->
+                                group_to_view(Group1);
+                            not_ready ->
+                                join_group(Self, GroupName)
+                        end
+                    catch
+                        exit:{R, _} when R =:= noproc; R =:= normal; R =:= shutdown ->
+                            join_group(
+                              Self, GroupName,
+                              record_dead_member_in_group(Left, GroupName))
+                    end
+            end
+    end.
+
 read_group(GroupName) ->
     case mnesia:dirty_read(?GROUP_TABLE, GroupName) of
         []      -> {error, not_found};
         [Group] -> Group
     end.
+
+prune_or_create_group(Self, GroupName) ->
+    {atomic, Group} =
+        mnesia:sync_transaction(
+          fun () -> GroupNew = #gm_group { name    = GroupName,
+                                           members = [Self],
+                                           version = 0 },
+                    case mnesia:read(?GROUP_TABLE, GroupName) of
+                        [] ->
+                            mnesia:write(GroupNew),
+                            GroupNew;
+                        [Group1 = #gm_group { members = Members }] ->
+                            case lists:any(fun is_member_alive/1, Members) of
+                                true ->
+                                    Group1;
+                                false ->
+                                    mnesia:write(GroupNew),
+                                    GroupNew
+                            end
+                    end
+          end),
+    Group.
 
 record_dead_member_in_group(Member, GroupName) ->
     {atomic, Group} =
@@ -579,33 +661,20 @@ record_dead_member_in_group(Member, GroupName) ->
           end),
     Group.
 
-record_new_member_in_group(Member, GroupName) ->
+record_new_member_in_group(GroupName, Left, NewMember, Fun) ->
     {atomic, Group} =
         mnesia:sync_transaction(
           fun () ->
-                  Group1 =
-                      case mnesia:read(?GROUP_TABLE, GroupName) of
-                          [Group2 = #gm_group { members = [_|_] = Members,
-                                                version = Ver }] ->
-                              %% we must join directly after something
-                              %% that's alive.
-                              Alive =
-                                  lists:filter(fun is_member_alive/1, Members),
-                              Left = lists:nth(random:uniform(length(Alive)),
-                                               Alive),
-                              {Prefix, [Left | Suffix]} =
-                                  lists:splitwith(
-                                    fun (M) -> M =/= Left end, Members),
-                              Members1 = Prefix ++ [Left, Member | Suffix],
-                              Group2 #gm_group { members = Members1,
-                                                 version = Ver + 1 };
-                          _ ->
-                              #gm_group { name    = GroupName,
-                                          members = [Member],
-                                          version = 0 }
-                      end,
-                  mnesia:write(Group1),
-                  Group1
+                  [#gm_group { members = Members, version = Ver } = Group1] =
+                      mnesia:read(?GROUP_TABLE, GroupName),
+                  {Prefix, [Left | Suffix]} =
+                      lists:splitwith(fun (M) -> M =/= Left end, Members),
+                  Members1 = Prefix ++ [Left, NewMember | Suffix],
+                  Group2 = Group1 #gm_group { members = Members1,
+                                              version = Ver + 1 },
+                  ok = Fun(Group2),
+                  mnesia:write(Group2),
+                  Group2
           end),
     Group.
 
