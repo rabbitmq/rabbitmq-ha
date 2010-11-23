@@ -380,6 +380,7 @@ handle_msg({catchup, _NotLeft, _MembersState}, State) ->
 handle_msg({activity, Left, Activity},
            State = #state { self          = Self,
                             left          = {Left, _MRefL},
+                            callback      = Callback,
                             view          = View,
                             members_state = MembersState })
   when MembersState =/= undefined ->
@@ -413,7 +414,9 @@ handle_msg({activity, Left, Activity},
                     end, Id, MembersStateActivity)
           end, {MembersState, activity_nil()}, Activity),
     State1 = State #state { members_state = MembersState1 },
-    ok = maybe_send_activity(Activity1, State1),
+    Activity3 = activity_finalise(Activity1),
+    ok = maybe_send_activity(Activity3, State1),
+    ok = callback(Callback, Activity3),
     State1;
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
@@ -803,21 +806,24 @@ activity_cons(Sender, Pubs, Acks, Tail) ->
 activity_finalise(Activity) ->
     queue:to_list(Activity).
 
+maybe_send_activity([], _State) ->
+    ok;
 maybe_send_activity(Activity, #state { self  = Self,
                                        right = {Right, _MRefR},
                                        view  = View }) ->
-    case activity_finalise(Activity) of
-        []        -> ok;
-        Activity1 -> gen_server2:cast(
-                       Right,
-                       {?TAG, view_version(View), {activity, Self, Activity1}})
-    end.
+    ok = gen_server2:cast(
+           Right, {?TAG, view_version(View), {activity, Self, Activity}}).
 
 send_activity(Self, Right, View, Activity) ->
     ok = send_right(Right, View, {activity, Self, activity_finalise(Activity)}).
 
 send_right(Right, View, Msg) ->
     ok = gen_server2:cast(Right, {?TAG, view_version(View), Msg}).
+
+callback(Callback, Activity) ->
+    [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Activity,
+                          {_PubNum, Pub} <- Pubs],
+    ok.
 
 
 %% ---------------------------------------------------------------------------

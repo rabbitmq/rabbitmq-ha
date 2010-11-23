@@ -29,7 +29,13 @@ callback(From, Msg) ->
                       ok = case dict:find(From, State) of
                                {ok, empty} -> ok;
                                {ok, Num}   -> ok;
-                               error       -> ok
+                               error       -> ok;
+                               {ok, Num1} when Num1 < Num ->
+                                   exit({{duplicate_delivery_of, Num1},
+                                         {expecting, Num}});
+                               {ok, Num1} ->
+                                   exit({{missing_delivery_of, Num},
+                                         {received_early, Num1}})
                            end,
                       dict:store(From, Num + 1, State)
               end
