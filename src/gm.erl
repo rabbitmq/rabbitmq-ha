@@ -175,7 +175,8 @@
 
 -behaviour(gen_server2).
 
--export([create_tables/0, join/2, ensure_joined/1, leave/1, broadcast/2]).
+-export([create_tables/0, start_link/2, wait_for_join/1, leave/1, broadcast/2,
+         group_members/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -222,17 +223,20 @@ create_tables([{Table, Attributes} | Tables]) ->
         Err                                   -> Err
     end.
 
-join(GroupName, Callback) ->
+start_link(GroupName, Callback) ->
     gen_server2:start_link(?MODULE, [GroupName, Callback], []).
 
-ensure_joined(Server) ->
-    gen_server2:call(Server, ensure_joined, infinity).
+wait_for_join(Server) ->
+    gen_server2:call(Server, wait_for_join, infinity).
 
 leave(Server) ->
     gen_server2:cast(Server, leave).
 
 broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
+
+group_members(Server) ->
+    gen_server2:call(Server, group_members, infinity).
 
 
 init([GroupName, Callback]) ->
@@ -252,13 +256,20 @@ init([GroupName, Callback]) ->
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 
-handle_call(ensure_joined, From,
+handle_call(wait_for_join, From,
             State = #state { members_state = undefined,
                              pending_join  = PendingJoin }) ->
     noreply(State #state { pending_join = [From | PendingJoin] });
 
-handle_call(ensure_joined, _From, State) ->
+handle_call(wait_for_join, _From, State) ->
     reply(ok, State);
+
+handle_call(group_members, _From,
+            State = #state { members_state = undefined }) ->
+    reply(not_joined, State);
+
+handle_call(group_members, _From, State = #state { view = View }) ->
+    reply(alive_view_members(View), State);
 
 handle_call({add_on_right, _NewMember}, _From,
             State = #state { members_state = undefined }) ->
@@ -518,6 +529,9 @@ find_view_member(Id, {_Ver, View}) ->
 
 blank_view(Ver) ->
     {Ver, dict:new()}.
+
+alive_view_members({_Ver, View}) ->
+    dict:fetch_keys(View).
 
 group_to_view(#gm_group { members = Members, version = Ver }) ->
     Alive = lists:filter(fun is_member_alive/1, Members),
