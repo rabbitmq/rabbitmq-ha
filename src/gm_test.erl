@@ -17,14 +17,19 @@ callback(From, Msg) ->
     with_state(
       fun (State) ->
               case Msg of
-                  {member_joined, Member} ->
-                      false = dict:is_key(Member, State),
-                      io:format("~p: + ~p~n", [self(), Member]),
-                      State;
-                  {member_left, Member} ->
-                      io:format("~p: - ~p (~p)~n",
-                                [self(), Member, dict:find(Member, State)]),
-                      dict:erase(Member, State);
+                  {view_change, Changes} ->
+                      Births = proplists:get_value(births, Changes),
+                      Deaths = proplists:get_value(deaths, Changes),
+                      State1 =
+                          lists:foldl(
+                            fun (Born, StateN) ->
+                                    false = dict:is_key(Born, StateN),
+                                    dict:store(Born, empty, StateN)
+                            end, State, Births),
+                      lists:foldl(
+                        fun (Died, StateN) ->
+                                dict:erase(Died, StateN)
+                        end, State1, Deaths);
                   {test_msg, Num} ->
                       ok = case dict:find(From, State) of
                                {ok, empty} -> ok;

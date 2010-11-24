@@ -278,7 +278,9 @@ handle_call({add_on_right, _NewMember}, _From,
 handle_call({add_on_right, NewMember}, _From,
             State = #state { self          = Self,
                              group_name    = GroupName,
-                             members_state = MembersState }) ->
+                             view          = View,
+                             members_state = MembersState,
+                             callback      = Callback }) ->
     Group = record_new_member_in_group(
               GroupName, Self, NewMember,
               fun (Group1) ->
@@ -287,18 +289,21 @@ handle_call({add_on_right, NewMember}, _From,
                                       {catchup, Self, prepare_members_state(
                                                         MembersState)})
               end),
-    View = group_to_view(Group),
-    reply({ok, Group}, check_neighbours(State #state { view = View })).
+    View2 = group_to_view(Group),
+    ok = callback_view_changed(Self, Callback, View, View2),
+    reply({ok, Group}, check_neighbours(State #state { view = View2 })).
 
 
 handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
                                                   left       = {Left, _MRefL},
                                                   right      = {Right, _MRefR},
                                                   view       = View,
-                                                  group_name = GroupName }) ->
+                                                  group_name = GroupName,
+                                                  callback   = Callback }) ->
     State1 = case needs_view_update(ReqVer, View) of
                  true ->
                      View1 = group_to_view(read_group(GroupName)),
+                     ok = callback_view_changed(Self, Callback, View, View1),
                      State2 = State #state { view = View1 },
                      case fetch_view_member(Self, View1) of
                          #view_member { left = Left, right = Right } ->
@@ -335,8 +340,10 @@ handle_cast({broadcast, Msg},
                            pub_count     = PubCount + 1 });
 
 handle_cast(join, State = #state { self       = Self,
-                                   group_name = GroupName }) ->
+                                   group_name = GroupName,
+                                   callback   = Callback }) ->
     View = join_group(Self, GroupName),
+    ok = callback_view_changed(Self, Callback, blank_view(0), View),
     noreply(check_neighbours(State #state { view = View }));
 
 handle_cast(leave, State) ->
@@ -448,9 +455,12 @@ handle_msg({activity, _NotLeft, _Activity}, State) ->
 
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { left       = Left,
+            State = #state { self       = Self,
+                             left       = Left,
                              right      = Right,
-                             group_name = GroupName }) ->
+                             group_name = GroupName,
+                             view       = View,
+                             callback   = Callback }) ->
     Member = case {Left, Right} of
                  {{Member1, MRef}, _} -> Member1;
                  {_, {Member1, MRef}} -> Member1;
@@ -460,9 +470,10 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
         undefined ->
             noreply(State);
         _ ->
-            View =
+            View1 =
                 group_to_view(record_dead_member_in_group(Member, GroupName)),
-            noreply(check_neighbours(State #state { view = View }))
+            ok = callback_view_changed(Self, Callback, View, View1),
+            noreply(check_neighbours(State #state { view = View1 }))
     end.
 
 
@@ -901,6 +912,18 @@ callback(Callback, Activity) ->
                           {_PubNum, Pub} <- Pubs],
     ok.
 
+callback_view_changed(Self, Callback, OldView, NewView) ->
+    OldAlive = alive_view_members(OldView),
+    NewAlive = alive_view_members(NewView),
+    Births = NewAlive -- OldAlive,
+    Deaths = OldAlive -- NewAlive,
+    case {Births, Deaths} of
+        {[], []} ->
+            ok;
+        _ ->
+            Callback(Self, {view_change, [{births, Births}, {deaths, Deaths}]})
+    end,
+    ok.
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
