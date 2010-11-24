@@ -248,7 +248,9 @@ pred process_reduction [p : Process] {
 fact { all p : Process | process_reduction[p] }
 
 pred example {
-	some ra: Process | retire_ack[ra]
-	#Member = 3
+	some ra: Process | retire_ack[ra] and retire_ack[ra.process_reduces_to]
+	some ip: Process | inject_pub[ip] and inject_pub[ip.process_reduces_to]
+	#Member = 2
+	#Pub = 2
 }
-run example for 10 but 1 View, 3 Member
+run example for 12 but 1 View, 2 Member

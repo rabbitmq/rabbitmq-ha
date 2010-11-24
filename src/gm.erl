@@ -193,8 +193,7 @@
           callback,
           view,
           pub_count,
-          members_state,
-          pending_join
+          members_state
         }).
 
 -record(gm_group, { name, version, members }).
@@ -244,8 +243,7 @@ init([GroupName, Callback]) ->
                   callback      = Callback,
                   view          = undefined,
                   pub_count     = 0,
-                  members_state = undefined,
-                  pending_join  = queue:new() }, hibernate,
+                  members_state = undefined }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 
@@ -289,15 +287,11 @@ handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
              end,
     noreply(handle_msg(Msg, State1));
 
-handle_cast({broadcast, Msg}, State = #state { self          = Self,
-                                               right         = Right,
-                                               members_state = MembersState,
-                                               pending_join  = PendingJoin,
-                                               pub_count     = PubCount })
+handle_cast({broadcast, _Msg}, State = #state { self          = Self,
+                                                right         = Right,
+                                                members_state = MembersState })
   when Right =:= {Self, undefined} orelse MembersState =:= undefined ->
-    noreply(
-      State #state { pending_join = queue:in({PubCount, Msg}, PendingJoin),
-                     pub_count    = PubCount + 1 });
+    noreply(State);
 
 handle_cast({broadcast, Msg},
             State = #state { self          = Self,
@@ -334,23 +328,10 @@ handle_msg({catchup, Left, MembersStateLeft},
                             left          = {Left, _MRefL},
                             right         = {Right, _MRefR},
                             view          = View,
-                            members_state = undefined,
-                            pending_join  = PendingJoin }) ->
+                            members_state = undefined }) ->
     ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
     MembersStateLeft1 = build_members_state(MembersStateLeft),
-    case queue:to_list(PendingJoin) of
-        [] ->
-            State #state { members_state = MembersStateLeft1 };
-        Pubs ->
-            Activity = activity_cons(Self, Pubs, [], activity_nil()),
-            ok = send_activity(Self, Right, View, Activity),
-            MembersState2 =
-                with_member(fun (Member) ->
-                                    Member #member { pending_ack = PendingJoin }
-                            end, Self, MembersStateLeft1),
-            State #state { members_state = MembersState2,
-                           pending_join  = queue:new() }
-    end;
+    State #state { members_state = MembersStateLeft1 };
 
 handle_msg({catchup, Left, MembersStateLeft},
            State = #state { self = Self,
