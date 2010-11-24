@@ -175,7 +175,7 @@
 
 -behaviour(gen_server2).
 
--export([create_tables/0, join/2, leave/1, broadcast/2]).
+-export([create_tables/0, join/2, ensure_joined/1, leave/1, broadcast/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -193,7 +193,8 @@
           callback,
           view,
           pub_count,
-          members_state
+          members_state,
+          pending_join
         }).
 
 -record(gm_group, { name, version, members }).
@@ -224,6 +225,9 @@ create_tables([{Table, Attributes} | Tables]) ->
 join(GroupName, Callback) ->
     gen_server2:start_link(?MODULE, [GroupName, Callback], []).
 
+ensure_joined(Server) ->
+    gen_server2:call(Server, ensure_joined, infinity).
+
 leave(Server) ->
     gen_server2:cast(Server, leave).
 
@@ -243,9 +247,18 @@ init([GroupName, Callback]) ->
                   callback      = Callback,
                   view          = undefined,
                   pub_count     = 0,
-                  members_state = undefined }, hibernate,
+                  members_state = undefined,
+                  pending_join  = [] }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
+
+handle_call(ensure_joined, From,
+            State = #state { members_state = undefined,
+                             pending_join  = PendingJoin }) ->
+    noreply(State #state { pending_join = [From | PendingJoin] });
+
+handle_call(ensure_joined, _From, State) ->
+    reply(ok, State);
 
 handle_call({add_on_right, _NewMember}, _From,
             State = #state { members_state = undefined }) ->
@@ -328,7 +341,9 @@ handle_msg({catchup, Left, MembersStateLeft},
                             left          = {Left, _MRefL},
                             right         = {Right, _MRefR},
                             view          = View,
-                            members_state = undefined }) ->
+                            members_state = undefined,
+                            pending_join  = PendingJoin }) ->
+    [gen_server2:reply(From, ok) || From <- lists:reverse(PendingJoin)],
     ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
     MembersStateLeft1 = build_members_state(MembersStateLeft),
     State #state { members_state = MembersStateLeft1 };

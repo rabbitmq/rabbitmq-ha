@@ -48,6 +48,7 @@ spawn_member() ->
               %% start up delay of no more than 10 seconds
               timer:sleep(random:uniform(10000)),
               {ok, Pid} = gm:join(?MODULE, fun callback/2),
+              ok = gm:ensure_joined(Pid),
               io:format("Joined ~p~n", [Pid]),
               Start = random:uniform(10000),
               send_loop(Pid, Start, Start + random:uniform(10000)),
