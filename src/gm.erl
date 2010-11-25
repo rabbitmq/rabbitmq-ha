@@ -104,7 +104,7 @@
 -behaviour(gen_server2).
 
 -export([create_tables/0, start_link/3, leave/1, broadcast/2,
-         group_members/1]).
+         confirmed_broadcast/2, group_members/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -125,7 +125,8 @@
           view,
           pub_count,
           members_state,
-          joined_args
+          joined_args,
+          confirms
         }).
 
 -record(gm_group, { name, version, members }).
@@ -143,7 +144,7 @@
 
 behaviour_info(callbacks) ->
     [
-     %% called when we've successfully joined the group. Supplied with
+     %% Called when we've successfully joined the group. Supplied with
      %% the known members of the group, appended to the list of args
      %% supplied to start_link.
      {joined, 1},
@@ -186,6 +187,9 @@ leave(Server) ->
 broadcast(Server, Msg) ->
     gen_server2:cast(Server, {broadcast, Msg}).
 
+confirmed_broadcast(Server, Msg) ->
+    gen_server2:call(Server, {confirmed_broadcast, Msg}, infinity).
+
 group_members(Server) ->
     gen_server2:call(Server, group_members, infinity).
 
@@ -202,9 +206,22 @@ init([GroupName, Module, Args]) ->
                   view          = undefined,
                   pub_count     = 0,
                   members_state = undefined,
-                  joined_args   = Args }, hibernate,
+                  joined_args   = Args,
+                  confirms      = queue:new() }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
+
+handle_call({confirmed_broadcast, _Msg}, _From,
+            State = #state { members_state = undefined }) ->
+    reply(not_joined, State);
+
+handle_call({confirmed_broadcast, _Msg}, _From,
+            State = #state { self  = Self,
+                             right = {Self, undefined} }) ->
+    reply(ok, State);
+
+handle_call({confirmed_broadcast, Msg}, From, State) ->
+    noreply(internal_broadcast(Msg, From, State));
 
 handle_call(group_members, _From,
             State = #state { members_state = undefined }) ->
@@ -269,22 +286,8 @@ handle_cast({broadcast, _Msg}, State = #state { self          = Self,
   when Right =:= {Self, undefined} orelse MembersState =:= undefined ->
     noreply(State);
 
-handle_cast({broadcast, Msg},
-            State = #state { self          = Self,
-                             right         = {Right, _MRefR},
-                             view          = View,
-                             pub_count     = PubCount,
-                             members_state = MembersState }) ->
-    PubMsg = {PubCount, Msg},
-    Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
-    ok = send_activity(Self, Right, View, Activity),
-    MembersState1 =
-        with_member(
-          fun (Member = #member { pending_ack = PA }) ->
-                  Member #member { pending_ack = queue:in(PubMsg, PA) }
-          end, Self, MembersState),
-    noreply(State #state { members_state = MembersState1,
-                           pub_count     = PubCount + 1 });
+handle_cast({broadcast, Msg}, State) ->
+    noreply(internal_broadcast(Msg, none, State));
 
 handle_cast(join, State = #state { self        = Self,
                                    group_name  = GroupName,
@@ -392,26 +395,31 @@ handle_msg({activity, Left, Activity},
                             left          = {Left, _MRefL},
                             module        = Module,
                             view          = View,
-                            members_state = MembersState })
+                            members_state = MembersState,
+                            confirms      = Confirms })
   when MembersState =/= undefined ->
-    {MembersState1, Activity1} =
+    {MembersState1, {Confirms1, Activity1}} =
         lists:foldl(
-          fun ({Id, Pubs, Acks}, MembersStateActivity) ->
+          fun ({Id, Pubs, Acks}, MembersStateConfirmsActivity) ->
                   with_member_acc(
                     fun (Member = #member { pending_ack = PA,
                                             last_pub    = LP,
-                                            last_ack    = LA }, Activity2) ->
+                                            last_ack    = LA },
+                         {Confirms2, Activity2}) ->
                             case is_member_alias(Id, Self, View) of
                                 true ->
                                     {ToAck, PA1} =
                                         find_common(queue_from_pubs(Pubs), PA,
                                                     queue:new()),
                                     LA1 = last_ack(Acks, LA),
+                                    AckNums = acks_from_queue(ToAck),
+                                    Confirms3 = maybe_confirm(
+                                                  Self, Id, Confirms2, AckNums),
                                     {Member #member { pending_ack = PA1,
                                                       last_ack    = LA1 },
-                                     activity_cons(
-                                       Id, [], acks_from_queue(ToAck),
-                                       Activity2)};
+                                     {Confirms3,
+                                      activity_cons(
+                                        Id, [], AckNums, Activity2)}};
                                 false ->
                                     PA1 = apply_acks(Acks, join_pubs(PA, Pubs)),
                                     LA1 = last_ack(Acks, LA),
@@ -419,11 +427,13 @@ handle_msg({activity, Left, Activity},
                                     {Member #member { pending_ack = PA1,
                                                       last_pub    = LP1,
                                                       last_ack    = LA1 },
-                                     activity_cons(Id, Pubs, Acks, Activity2)}
+                                     {Confirms2,
+                                      activity_cons(Id, Pubs, Acks, Activity2)}}
                             end
-                    end, Id, MembersStateActivity)
-          end, {MembersState, activity_nil()}, Activity),
-    State1 = State #state { members_state = MembersState1 },
+                    end, Id, MembersStateConfirmsActivity)
+          end, {MembersState, {Confirms, activity_nil()}}, Activity),
+    State1 = State #state { members_state = MembersState1,
+                            confirms      = Confirms1 },
     Activity3 = activity_finalise(Activity1),
     ok = maybe_send_activity(Activity3, State1),
     {callback(Module, Activity3), State1};
@@ -447,6 +457,30 @@ a(#state { self = Self,
            view = View }) ->
     #view_member { left = Left } = fetch_view_member(Self, View),
     ok.
+
+internal_broadcast(Msg, From,
+            State = #state { self          = Self,
+                             right         = {Right, _MRefR},
+                             view          = View,
+                             pub_count     = PubCount,
+                             members_state = MembersState,
+                             confirms      = Confirms }) ->
+    PubMsg = {PubCount, Msg},
+    Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
+    ok = send_activity(Self, Right, View, Activity),
+    MembersState1 =
+        with_member(
+          fun (Member = #member { pending_ack = PA }) ->
+                  Member #member { pending_ack = queue:in(PubMsg, PA) }
+          end, Self, MembersState),
+    Confirms1 = case From of
+                    none -> Confirms;
+                    _    -> queue:in({PubCount, From}, Confirms)
+                end,
+    State #state { pub_count     = PubCount + 1,
+                   members_state = MembersState1,
+                   confirms      = Confirms1 }.
+
 
 %% ---------------------------------------------------------------------------
 %% View construction and inspection
@@ -718,19 +752,24 @@ check_neighbours(State = #state { self          = Self,
                                   left          = Left,
                                   right         = Right,
                                   view          = View,
-                                  members_state = MembersState }) ->
+                                  members_state = MembersState,
+                                  confirms      = Confirms }) ->
     #view_member { left = VLeft, right = VRight }
         = fetch_view_member(Self, View),
     Ver = view_version(View),
     Left1 = ensure_neighbour(Ver, Self, Left, VLeft),
     Right1 = ensure_neighbour(Ver, Self, Right, VRight),
-    MembersState1 =
+    {MembersState1, Confirms1} =
         case {Left1, Right1} of
-            {{Self, undefined}, {Self, undefined}} -> blank_member_state();
-            _                                      -> MembersState
+            {{Self, undefined}, {Self, undefined}} ->
+                {blank_member_state(), purge_confirms(Confirms)};
+            _ ->
+                {MembersState, Confirms}
         end,
-    State1 = State #state { left = Left1, right = Right1,
-                            members_state = MembersState1 },
+    State1 = State #state { left          = Left1,
+                            right         = Right1,
+                            members_state = MembersState1,
+                            confirms      = Confirms1 },
     ok = maybe_send_catchup(Right, State1),
     State1.
 
@@ -881,6 +920,25 @@ handle_callback_result({ok, Reply, State}) ->
     reply(Reply, State);
 handle_callback_result({{stop, Reason}, Reply, State}) ->
     {stop, Reason, Reply, State}.
+
+maybe_confirm(_Self, _Id, Confirms, []) ->
+    Confirms;
+maybe_confirm(Self, Self, Confirms, [PubNum | PubNums]) ->
+    case queue:out(Confirms) of
+        {empty, _Confirms} ->
+            Confirms;
+        {{value, {PubNum, From}}, Confirms1} ->
+            gen_server2:reply(From, ok),
+            maybe_confirm(Self, Self, Confirms1, PubNums);
+        {{value, {PubNum1, _From}}, _Confirms} when PubNum1 > PubNum ->
+            maybe_confirm(Self, Self, Confirms, PubNums)
+    end;
+maybe_confirm(_Self, _Id, Confirms, _PubNums) ->
+    Confirms.
+
+purge_confirms(Confirms) ->
+    [gen_server2:reply(From, ok) || {_PubNum, From} <- queue:to_list(Confirms)],
+    queue:new().
 
 
 %% ---------------------------------------------------------------------------

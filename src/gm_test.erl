@@ -89,7 +89,10 @@ spawn_more() ->
 send_loop(_Pid, Target, Target) ->
     ok;
 send_loop(Pid, Count, Target) when Target > Count ->
-    gm:broadcast(Pid, {test_msg, Count}),
+    case random:uniform(3) of
+        3 -> gm:confirmed_broadcast(Pid, {test_msg, Count});
+        _ -> gm:broadcast(Pid, {test_msg, Count})
+    end,
     timer:sleep(random:uniform(5) - 1), %% sleep up to 4 ms
     send_loop(Pid, Count + 1, Target).
 
