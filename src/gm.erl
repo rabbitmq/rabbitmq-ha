@@ -1,22 +1,17 @@
-%%   The contents of this file are subject to the Mozilla Public License
-%%   Version 1.1 (the "License"); you may not use this file except in
-%%   compliance with the License. You may obtain a copy of the License at
-%%   http://www.mozilla.org/MPL/
+%% The contents of this file are subject to the Mozilla Public License
+%% Version 1.1 (the "License"); you may not use this file except in
+%% compliance with the License. You may obtain a copy of the License at
+%% http://www.mozilla.org/MPL/
 %%
-%%   Software distributed under the License is distributed on an "AS IS"
-%%   basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
-%%   License for the specific language governing rights and limitations
-%%   under the License.
+%% Software distributed under the License is distributed on an "AS IS"
+%% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
+%% License for the specific language governing rights and limitations
+%% under the License.
 %%
-%%   The Original Code is RabbitMQ-HA.
+%% The Original Code is RabbitMQ.
 %%
-%%   The Initial Developers of the Original Code are Rabbit Technologies Ltd.
-%%
-%%   Copyright (C) 2010 Rabbit Technologies Ltd.
-%%
-%%   All Rights Reserved.
-%%
-%%   Contributor(s): ______________________________________.
+%% The Initial Developer of the Original Code is VMware, Inc.
+%% Copyright (c) 2007-2010 VMware, Inc.  All rights reserved.
 %%
 
 -module(gm).
@@ -38,6 +33,8 @@
 %% continue to propogate to all group members, including new group
 %% members, provided the new members have joined before the message
 %% has reached all members of the group.
+%%
+%% Implementation Overview
 %%
 %% One possible means of implementation would be a fanout from the
 %% sender to every member of the group. This would require that the
@@ -103,83 +100,16 @@
 %% acknowledgements must update their own internal state accordingly
 %% (the sending member must also do this in order to be able to
 %% accomodate failures).
-%%
-%% We also have three distinct failure scenarios: imagine the chain of
-%% A -> B -> C:
-%%
-%% 1. If B dies then A must contact C and directly tell C the messages
-%% which are unacknowledged and the last acknowledgement seen. This is
-%% the normal case for the failure of intermediate members. The list
-%% of unacknowledged messages C receives from A may be equal to or a
-%% suffix of the list of unacknowledged messages that C knows of:
-%% acknowledgements are found from messages C knows of at the head of
-%% the list which A has removed, whilst additional publishes are
-%% present at the end of A's list which are absent from C's. Thus if
-%% C's list of unacknowledged messages is [1,2,3] and the list it
-%% receives from A is [3,4] then it knows that it should acknowledge 1
-%% and 2, and publish 4.
-%%
-%% 2. If C dies then A will receive from B all the unacknowledged
-%% messages as known by B. However, A, as the sender of messages, must
-%% calculate from this the messages B is therefore implying A was
-%% about to receive from C, and for which A was then about to issue
-%% acknowledgements for. If A has a list of messages pending
-%% acknowledgement of [4,5,6] and it receives from B the list of
-%% [3,4,5] then it means: A has already sent out the acknowledgement
-%% for 3, but it hasn't yet made it to B (no action to take for this -
-%% A needs to take no actions concerning acknowledgements that were
-%% lost (which C was about to send back to A but failed to do so as C
-%% died) - A would have taken no action upon receipt of these messages
-%% had they come from C); and that the publication of messages 4 and 5
-%% made it to B, but A is yet to acknowledge these messages, and so A
-%% should now send out the acknowledgements for messages 4 and 5,
-%% reducing its list of messages pending acknowledgement to just
-%% [6].
-%%
-%% 3. If A dies then B must now take responsibility for the actions
-%% that A would have performed upon receiving its own messages back
-%% (i.e. converting them to acknowledgements and sending them on),
-%% plus not sending on any acknowledgements it receives. I.e. B is now
-%% in charge of the messages that were still alive when A died. The
-%% same scenarios are valid here as in case (2) above: B is sure to
-%% know at least as much as any one else about the messages that A
-%% sent. Correspondingly, the detection of acknowledgements and
-%% publications are the same: B can simply pretend that it sent the
-%% messages.
-%%
-%% In the event of a member joining the chain, they can join at any
-%% location within the chain. Their upstream member will send them the
-%% unacknowledged messages, which the new member will update its own
-%% state with, interpret the messages unacknowledged, but not forward
-%% such messages on (as the nearest downstream member would already
-%% have been sent such messages).
-%%
-%% In the example chain A -> B -> C, care must be taken in the event
-%% of the death of B, that C does not process any messages it receives
-%% from B that were in flight but unreceived at the point of the death
-%% of B, _after_ it has established contact from A.
-%%
-%% Finally, we abstract all the above so that any member of the group
-%% can send messages: thus all group members are equal and can
-%% simultaneously play the roles of A, B or C from the above
-%% description depending solely on whether they or someone else sent
-%% each message.
-%%
-%% Obvious extension points:
-%%
-%% 1. When sending a message, indicate which members of the group the
-%% message is intended for. Everything proceeds as above: the only
-%% change is that members not in the recipients list do not invoke
-%% their callback for such messages.
-%%
 
 -behaviour(gen_server2).
 
--export([create_tables/0, start_link/2, wait_for_join/1, leave/1, broadcast/2,
+-export([create_tables/0, start_link/3, leave/1, broadcast/2,
          group_members/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
+
+-export([behaviour_info/1]).
 
 -define(GROUP_TABLE, gm_group).
 -define(HIBERNATE_AFTER_MIN, 1000).
@@ -191,11 +121,11 @@
           left,
           right,
           group_name,
-          callback,
+          module,
           view,
           pub_count,
           members_state,
-          pending_join
+          joined_args
         }).
 
 -record(gm_group, { name, version, members }).
@@ -211,6 +141,30 @@
                          {attributes, record_info(fields, gm_group)}]}
         ]).
 
+behaviour_info(callbacks) ->
+    [
+     %% called when we've successfully joined the group. Supplied with
+     %% the known members of the group, appended to the list of args
+     %% supplied to start_link.
+     {joined, 1},
+
+     %% Called when the members have changed. First arg is the list of
+     %% new members. Second arg is the list of members previously
+     %% known to us that have since died.
+     {members_changed, 2},
+
+     %% Called with each new message received from other
+     %% members. First arg is the sender. Second arg is the
+     %% message. This does not get called for messages injected by
+     %% this member.
+     {handle_msg, 2},
+
+     %% Called on gm member termination as per rules in gen_server
+     {terminate, 1}
+    ];
+behaviour_info(_Other) ->
+    undefined.
+
 create_tables() ->
     create_tables(?TABLES).
 
@@ -223,11 +177,8 @@ create_tables([{Table, Attributes} | Tables]) ->
         Err                                   -> Err
     end.
 
-start_link(GroupName, Callback) ->
-    gen_server2:start_link(?MODULE, [GroupName, Callback], []).
-
-wait_for_join(Server) ->
-    gen_server2:call(Server, wait_for_join, infinity).
+start_link(GroupName, Module, Args) ->
+    gen_server2:start_link(?MODULE, [GroupName, Module, Args], []).
 
 leave(Server) ->
     gen_server2:cast(Server, leave).
@@ -239,8 +190,7 @@ group_members(Server) ->
     gen_server2:call(Server, group_members, infinity).
 
 
-init([GroupName, Callback]) ->
-    process_flag(trap_exit, true),
+init([GroupName, Module, Args]) ->
     random:seed(now()),
     gen_server2:cast(self(), join),
     Self = self(),
@@ -248,21 +198,13 @@ init([GroupName, Callback]) ->
                   left          = {Self, undefined},
                   right         = {Self, undefined},
                   group_name    = GroupName,
-                  callback      = Callback,
+                  module        = Module,
                   view          = undefined,
                   pub_count     = 0,
                   members_state = undefined,
-                  pending_join  = [] }, hibernate,
+                  joined_args   = Args }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
-
-handle_call(wait_for_join, From,
-            State = #state { members_state = undefined,
-                             pending_join  = PendingJoin }) ->
-    noreply(State #state { pending_join = [From | PendingJoin] });
-
-handle_call(wait_for_join, _From, State) ->
-    reply(ok, State);
 
 handle_call(group_members, _From,
             State = #state { members_state = undefined }) ->
@@ -280,7 +222,7 @@ handle_call({add_on_right, NewMember}, _From,
                              group_name    = GroupName,
                              view          = View,
                              members_state = MembersState,
-                             callback      = Callback }) ->
+                             module        = Module }) ->
     Group = record_new_member_in_group(
               GroupName, Self, NewMember,
               fun (Group1) ->
@@ -290,8 +232,9 @@ handle_call({add_on_right, NewMember}, _From,
                                                         MembersState)})
               end),
     View2 = group_to_view(Group),
-    ok = callback_view_changed(Self, Callback, View, View2),
-    reply({ok, Group}, check_neighbours(State #state { view = View2 })).
+    State1 = check_neighbours(State #state { view = View2 }),
+    Result = callback_view_changed(Module, View, View2),
+    handle_callback_result({Result, {ok, Group}, State1}).
 
 
 handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
@@ -299,22 +242,26 @@ handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
                                                   right      = {Right, _MRefR},
                                                   view       = View,
                                                   group_name = GroupName,
-                                                  callback   = Callback }) ->
-    State1 = case needs_view_update(ReqVer, View) of
-                 true ->
-                     View1 = group_to_view(read_group(GroupName)),
-                     ok = callback_view_changed(Self, Callback, View, View1),
-                     State2 = State #state { view = View1 },
-                     case fetch_view_member(Self, View1) of
-                         #view_member { left = Left, right = Right } ->
-                             State2;
-                         _ ->
-                             check_neighbours(State2)
-                     end;
-                 false ->
-                     State
-             end,
-    noreply(handle_msg(Msg, State1));
+                                                  module     = Module }) ->
+    {Result, State1} =
+        case needs_view_update(ReqVer, View) of
+            true ->
+                View1 = group_to_view(read_group(GroupName)),
+                Result1 = callback_view_changed(Module, View, View1),
+                State2 = State #state { view = View1 },
+                {Result1, case fetch_view_member(Self, View1) of
+                              #view_member { left = Left, right = Right } ->
+                                  State2;
+                              _ ->
+                                  check_neighbours(State2)
+                          end};
+            false ->
+                {ok, State}
+        end,
+    case Result of
+        ok -> handle_callback_result(handle_msg(Msg, State1));
+        _  -> handle_callback_result({Result, State1})
+    end;
 
 handle_cast({broadcast, _Msg}, State = #state { self          = Self,
                                                 right         = Right,
@@ -339,32 +286,63 @@ handle_cast({broadcast, Msg},
     noreply(State #state { members_state = MembersState1,
                            pub_count     = PubCount + 1 });
 
-handle_cast(join, State = #state { self       = Self,
-                                   group_name = GroupName,
-                                   callback   = Callback }) ->
+handle_cast(join, State = #state { self        = Self,
+                                   group_name  = GroupName,
+                                   module      = Module,
+                                   joined_args = Args }) ->
     View = join_group(Self, GroupName),
-    ok = callback_view_changed(Self, Callback, blank_view(0), View),
-    noreply(check_neighbours(State #state { view = View }));
+    State1 = check_neighbours(State #state { view = View }),
+    handle_callback_result(
+      {Module:joined(Args ++ [alive_view_members(View)]), State1});
 
 handle_cast(leave, State) ->
     {stop, normal, State}.
 
 
+handle_info({'DOWN', MRef, process, _Pid, _Reason},
+            State = #state { left       = Left,
+                             right      = Right,
+                             group_name = GroupName,
+                             view       = View,
+                             module     = Module }) ->
+    Member = case {Left, Right} of
+                 {{Member1, MRef}, _} -> Member1;
+                 {_, {Member1, MRef}} -> Member1;
+                 _                    -> undefined
+             end,
+    case Member of
+        undefined ->
+            noreply(State);
+        _ ->
+            View1 =
+                group_to_view(record_dead_member_in_group(Member, GroupName)),
+            State1 = check_neighbours(State #state { view = View1 }),
+            handle_callback_result(
+              {callback_view_changed(Module, View, View1), State1})
+    end.
+
+
+terminate(Reason, #state { module = Module }) ->
+    Module:terminate(Reason).
+
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+
 handle_msg(check_neighbours, State) ->
     %% no-op - it's already been done by the calling handle_cast
-    State;
+    {ok, State};
 
 handle_msg({catchup, Left, MembersStateLeft},
            State = #state { self          = Self,
                             left          = {Left, _MRefL},
                             right         = {Right, _MRefR},
                             view          = View,
-                            members_state = undefined,
-                            pending_join  = PendingJoin }) ->
-    [gen_server2:reply(From, ok) || From <- lists:reverse(PendingJoin)],
+                            members_state = undefined }) ->
     ok = send_right(Right, View, {catchup, Self, MembersStateLeft}),
     MembersStateLeft1 = build_members_state(MembersStateLeft),
-    State #state { members_state = MembersStateLeft1 };
+    {ok, State #state { members_state = MembersStateLeft1 }};
 
 handle_msg({catchup, Left, MembersStateLeft},
            State = #state { self = Self,
@@ -399,19 +377,20 @@ handle_msg({catchup, Left, MembersStateLeft},
                             end
                     end, Id, MembersStateActivity)
           end, {MembersState, activity_nil()}, AllMembers),
-    State1 = handle_msg({activity, Left, activity_finalise(Activity)},
-                        State #state { members_state = MembersState1 }),
+    {Result, State1} =
+        handle_msg({activity, Left, activity_finalise(Activity)},
+                   State #state { members_state = MembersState1 }),
     %% we can only tidy up when we know we've receive all pubs for
     %% inherited members
-    maybe_erase_aliases(State1);
+    {Result, maybe_erase_aliases(State1)};
 
 handle_msg({catchup, _NotLeft, _MembersState}, State) ->
-    State;
+    {ok, State};
 
 handle_msg({activity, Left, Activity},
            State = #state { self          = Self,
                             left          = {Left, _MRefL},
-                            callback      = Callback,
+                            module        = Module,
                             view          = View,
                             members_state = MembersState })
   when MembersState =/= undefined ->
@@ -447,45 +426,9 @@ handle_msg({activity, Left, Activity},
     State1 = State #state { members_state = MembersState1 },
     Activity3 = activity_finalise(Activity1),
     ok = maybe_send_activity(Activity3, State1),
-    ok = callback(Callback, Activity3),
-    State1;
+    {callback(Module, Activity3), State1};
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
-    State.
-
-
-handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { self       = Self,
-                             left       = Left,
-                             right      = Right,
-                             group_name = GroupName,
-                             view       = View,
-                             callback   = Callback }) ->
-    Member = case {Left, Right} of
-                 {{Member1, MRef}, _} -> Member1;
-                 {_, {Member1, MRef}} -> Member1;
-                 _                    -> undefined
-             end,
-    case Member of
-        undefined ->
-            noreply(State);
-        _ ->
-            View1 =
-                group_to_view(record_dead_member_in_group(Member, GroupName)),
-            ok = callback_view_changed(Self, Callback, View, View1),
-            noreply(check_neighbours(State #state { view = View1 }))
-    end.
-
-
-terminate(normal, _State) ->
-    ok;
-terminate(Reason, State) ->
-    io:format("~p died~n~p~nreason: ~p~nstate: ~p~n",
-              [self(), read_group(State#state.group_name), Reason, State]),
-    ok.
-
-
-code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 
@@ -907,12 +850,18 @@ send_activity(Self, Right, View, Activity) ->
 send_right(Right, View, Msg) ->
     ok = gen_server2:cast(Right, {?TAG, view_version(View), Msg}).
 
-callback(Callback, Activity) ->
-    [Callback(Id, Pub) || {Id, Pubs, _Acks} <- Activity,
-                          {_PubNum, Pub} <- Pubs],
-    ok.
+callback(Module, Activity) ->
+    lists:foldl(
+      fun ({Id, Pubs, _Acks}, ok) ->
+              lists:foldl(
+                fun ({_PubNum, Pub}, ok) -> Module:handle_msg(Id, Pub);
+                    (_, Error)           -> Error
+                end, ok, Pubs);
+          (_, Error) ->
+              Error
+      end, ok, Activity).
 
-callback_view_changed(Self, Callback, OldView, NewView) ->
+callback_view_changed(Module, OldView, NewView) ->
     OldAlive = alive_view_members(OldView),
     NewAlive = alive_view_members(NewView),
     Births = NewAlive -- OldAlive,
@@ -921,9 +870,18 @@ callback_view_changed(Self, Callback, OldView, NewView) ->
         {[], []} ->
             ok;
         _ ->
-            Callback(Self, {view_change, [{births, Births}, {deaths, Deaths}]})
-    end,
-    ok.
+            Module:members_changed(Births, Deaths)
+    end.
+
+handle_callback_result({ok, State}) ->
+    noreply(State);
+handle_callback_result({{stop, Reason}, State}) ->
+    {stop, Reason, State};
+handle_callback_result({ok, Reply, State}) ->
+    reply(Reply, State);
+handle_callback_result({{stop, Reason}, Reply, State}) ->
+    {stop, Reason, Reply, State}.
+
 
 %% ---------------------------------------------------------------------------
 %% Msg transformation
