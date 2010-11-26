@@ -1018,12 +1018,9 @@ maybe_erase_aliases(State = #state { self          = Self,
     end,
     State #state { members_state = MembersState1 }.
 
-can_erase_view_member(Self, Self, _LA, _LP) ->
-    false;
-can_erase_view_member(_Self, _Id, N, N) ->
-    true;
-can_erase_view_member(_Self, _Id, _LA, _LP) ->
-    false.
+can_erase_view_member(Self, Self, _LA, _LP) -> false;
+can_erase_view_member(_Self, _Id,   N,   N) -> true;
+can_erase_view_member(_Self, _Id, _LA, _LP) -> false.
 
 
 %% ---------------------------------------------------------------------------
@@ -1206,10 +1203,8 @@ callback_view_changed(Module, OldView, NewView) ->
     Births = NewMembers -- OldMembers,
     Deaths = OldMembers -- NewMembers,
     case {Births, Deaths} of
-        {[], []} ->
-            ok;
-        _ ->
-            Module:members_changed(Births, Deaths)
+        {[], []} -> ok;
+        _        -> Module:members_changed(Births, Deaths)
     end.
 
 handle_callback_result({ok, State}) ->
