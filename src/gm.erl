@@ -460,14 +460,12 @@ a(#state { self = Self,
 
 internal_broadcast(Msg, From,
             State = #state { self          = Self,
-                             right         = {Right, _MRefR},
-                             view          = View,
                              pub_count     = PubCount,
                              members_state = MembersState,
                              confirms      = Confirms }) ->
     PubMsg = {PubCount, Msg},
     Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
-    ok = send_activity(Self, Right, View, Activity),
+    ok = maybe_send_activity(activity_finalise(Activity), State),
     MembersState1 =
         with_member(
           fun (Member = #member { pending_ack = PA }) ->
@@ -880,11 +878,7 @@ maybe_send_activity([], _State) ->
 maybe_send_activity(Activity, #state { self  = Self,
                                        right = {Right, _MRefR},
                                        view  = View }) ->
-    ok = gen_server2:cast(
-           Right, {?TAG, view_version(View), {activity, Self, Activity}}).
-
-send_activity(Self, Right, View, Activity) ->
-    ok = send_right(Right, View, {activity, Self, activity_finalise(Activity)}).
+    send_right(Right, View, {activity, Self, Activity}).
 
 send_right(Right, View, Msg) ->
     ok = gen_server2:cast(Right, {?TAG, view_version(View), Msg}).
