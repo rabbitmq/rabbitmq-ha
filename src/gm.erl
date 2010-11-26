@@ -907,7 +907,8 @@ join_group(Self, GroupName, #gm_group { members = Members } = Group) ->
                             not_ready    -> join_group(Self, GroupName)
                         end
                     catch
-                        exit:{R, _} when R =:= noproc; R =:= normal; R =:= shutdown ->
+                        exit:{R, _}
+                          when R =:= noproc; R =:= normal; R =:= shutdown ->
                             join_group(
                               Self, GroupName,
                               record_dead_member_in_group(Left, GroupName))
