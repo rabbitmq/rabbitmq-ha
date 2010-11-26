@@ -55,7 +55,7 @@ handle_msg(From, {test_msg, Num}) ->
                        {ok, empty} -> ok;
                        {ok, Num}   -> ok;
                        error       -> ok;
-                       {ok, Num1} when Num1 < Num ->
+                       {ok, Num1} when Num < Num1 ->
                            exit({{from, From},
                                  {duplicate_delivery_of, Num1},
                                  {expecting, Num}});
