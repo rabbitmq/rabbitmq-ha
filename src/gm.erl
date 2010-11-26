@@ -331,6 +331,44 @@
 %% from the member).
 %%
 %% Proof by induction on the applicable operational semantics.
+%%
+%%
+%% Related work
+%% ------------
+%%
+%% The ring configuration and double traversal of messages around the
+%% ring is similar (though developed independently) to the LCR
+%% protocol by [Levy 2008]. However, LCR differs in several
+%% ways. Firstly, by using vector clocks, it enforces a total order of
+%% message delivery, which is unnecessary for our purposes. More
+%% significantly, it is built on top of a "group communication system"
+%% which performs the group management functions, taking
+%% responsibility away from the protocol as to how to cope with safely
+%% adding and removing members. When membership changes do occur, the
+%% protocol stipulates that every member must perform communication
+%% with every other member of the group, to ensure all outstanding
+%% deliveries complete, before the entire group transitions to the new
+%% view. This, in total, requires two sets of all-to-all synchronous
+%% communications.
+%%
+%% This is not only rather inefficient, but also does not explain what
+%% happens upon the failure of a member during this process. It does
+%% though entirely avoid the need for inheritance of responsibility of
+%% dead members that our protocol incorporates.
+%%
+%% In [Marandi et al 2010], a Paxos-based protocol is described. This
+%% work explicity focusses on the efficiency of communication. LCR
+%% (and our protocol too) are more efficient, but at the cost of
+%% higher latency. The Ring-Paxos protocol is itself built on top of
+%% IP-multicast, which rules it out for many applications where
+%% point-to-point communication is all that can be required. They also
+%% have an excellent related work section which I really ought to
+%% read...
+%%
+%%
+%% [Levy 2008] The Complexity of Reliable Distributed Storage, 2008.
+%% [Marandi et al 2010] Ring Paxos: A High-Throughput Atomic Broadcast
+%% Protocol
 
 
 -behaviour(gen_server2).
