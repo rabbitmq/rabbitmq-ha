@@ -31,7 +31,7 @@
 %%
 %% The guarantee given is that provided a message, once sent, makes it
 %% to members who do not all leave the group, the message will
-%% continue to propogate to all group members.
+%% continue to propagate to all group members.
 %%
 %% Another way of stating the guarantee is that if member P publishes
 %% messages m and m', then for all members P', if P' is a member of
@@ -39,7 +39,7 @@
 %% P' will receive m.
 %%
 %% Note that only local-ordering is enforced: i.e. if member P sends
-%% message m and then message m', then forall members P', if P'
+%% message m and then message m', then for-all members P', if P'
 %% receives m and m', then they will receive m' after m. Causality
 %% ordering is _not_ enforced. I.e. if member P receives message m
 %% and as a result publishes message m', there is no guarantee that
@@ -85,7 +85,7 @@
 %% Implementation Overview
 %% -----------------------
 %%
-%% One possible means of implementation would be a fanout from the
+%% One possible means of implementation would be a fan-out from the
 %% sender to every member of the group. This would require that the
 %% group is fully connected, and, in the event that the original
 %% sender of the message disappears from the group before the message
@@ -95,9 +95,9 @@
 %% if the sender dies part way through, who is responsible for
 %% ensuring that the remaining Members receive the Msg? In the event
 %% that within the group, messages sent are broadcast from a subset of
-%% the members, the fanout arrangement has the potential to
+%% the members, the fan-out arrangement has the potential to
 %% substantially impact the CPU and network workload of such members,
-%% as such members would have to accomodate the cost of sending each
+%% as such members would have to accommodate the cost of sending each
 %% message to every group member.
 %%
 %% Instead, if the members of the group are arranged in a chain, then
@@ -105,7 +105,7 @@
 %% each message and who has not. It eases issues of responsibility: in
 %% the event of a group member disappearing, the nearest upstream
 %% member of the chain is responsible for ensuring that messages
-%% continue to propogate down the chain. It also results in equal
+%% continue to propagate down the chain. It also results in equal
 %% distribution of sending and receiving workload, even if all
 %% messages are being sent from just a single group member. This
 %% configuration has the further advantage that it is not necessary
@@ -153,7 +153,7 @@
 %% 2. The other group members who upon receiving messages and
 %% acknowledgements must update their own internal state accordingly
 %% (the sending member must also do this in order to be able to
-%% accomodate failures), and forwards messages on to their downstream
+%% accommodate failures), and forwards messages on to their downstream
 %% neighbours.
 %%
 %%
@@ -277,7 +277,7 @@
 %% likely crash).
 %%
 %% Thus very simply, we have that each subsequent view contains more
-%% information than the preceeding view.
+%% information than the preceding view.
 %%
 %% However, to avoid the views growing indefinitely, we need to be
 %% able to delete members which have died _and_ for which no messages
@@ -286,14 +286,14 @@
 %% inherit a member because we are the nearest downstream member which
 %% implies that we know at least as much than everyone else about the
 %% publications of the dead member), and we know the earliest message
-%% for which the acknowledgment is still in flight.
+%% for which the acknowledgement is still in flight.
 %%
 %% In the chain A -> B -> C, when B dies, A will send to C its state
 %% (as C is the new downstream from A), allowing C to calculate which
 %% messages it has missed out on (described above). At this point, C
 %% also inherits B's messages. If that state from A also includes the
-%% last message published by B for which an acknowledgment has been
-%% seen, then C knows exactly which further acknowledgments it must
+%% last message published by B for which an acknowledgement has been
+%% seen, then C knows exactly which further acknowledgements it must
 %% receive (also including issuing acknowledgements for publications
 %% still in-flight that it receives), after which it is known there
 %% are no more messages in flight for B, thus all evidence that B was
@@ -357,7 +357,7 @@
 %% dead members that our protocol incorporates.
 %%
 %% In [Marandi et al 2010], a Paxos-based protocol is described. This
-%% work explicity focusses on the efficiency of communication. LCR
+%% work explicitly focuses on the efficiency of communication. LCR
 %% (and our protocol too) are more efficient, but at the cost of
 %% higher latency. The Ring-Paxos protocol is itself built on top of
 %% IP-multicast, which rules it out for many applications where
