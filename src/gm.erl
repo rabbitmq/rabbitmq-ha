@@ -35,6 +35,13 @@
 %% members, provided the new members have joined before the message
 %% has reached all members of the group.
 %%
+%% Note that only local-ordering is enforced: i.e. if member P sends
+%% message m and then message m', then forall members P', if P'
+%% receives m and m', then they will receive m' after m. Causality
+%% ordering is _not_ enforced. I.e. if member P receives message m
+%% and as a result publishes message m', there is no guarantee that
+%% other members P' will receive m before m'.
+%%
 %%
 %% API Use
 %% -------
@@ -81,51 +88,56 @@
 %% sender of the message disappears from the group before the message
 %% has made it to every member of the group, raises questions as to
 %% who is responsible for sending on the message to new group members.
-%% In the event that within the group, messages sent are broadcast
-%% from a subset of the members, this arrangement has the potential to
+%% In particular, the issue is with [ Pid ! Msg || Pid <- Members ] -
+%% if the sender dies part way through, who is responsible for
+%% ensuring that the remaining Members receive the Msg? In the event
+%% that within the group, messages sent are broadcast from a subset of
+%% the members, the fanout arrangement has the potential to
 %% substantially impact the CPU and network workload of such members,
 %% as such members would have to accomodate the cost of sending each
 %% message to every group member.
 %%
 %% Instead, if the members of the group are arranged in a chain, then
-%% it makes it much easier to ensure that it is possible to reason
-%% about who within the group has received the message and who has
-%% not. It eases issues of responsibility: in the event of a group
-%% member disappearing, the nearest upstream member of the chain is
-%% responsible for ensuring that messages continue to propogate down
-%% the chain. It also results in equal distribution of sending and
-%% receiving workload, even if all messages are being sent from just a
-%% single group member. This configuration has the further advantage
-%% that it is not necessary for every group member to know of every
-%% other group member, and even that a group member does not have to
-%% be accessible from all other group members.
+%% it becomes easier to reason about who within the group has received
+%% each message and who has not. It eases issues of responsibility: in
+%% the event of a group member disappearing, the nearest upstream
+%% member of the chain is responsible for ensuring that messages
+%% continue to propogate down the chain. It also results in equal
+%% distribution of sending and receiving workload, even if all
+%% messages are being sent from just a single group member. This
+%% configuration has the further advantage that it is not necessary
+%% for every group member to know of every other group member, and
+%% even that a group member does not have to be accessible from all
+%% other group members.
 %%
 %% Performance is kept high by permitting pipelining and all
-%% communication is asynchronous. In the chain A -> B -> C, if A sends
-%% a message to the group, it will not directly contact C. However, it
-%% must know that C receives the message (in addition to B) before it
-%% can consider the message fully sent. A simplistic implementation
-%% would require that C replies to B and B then replies to A. This
-%% would then mean that the propagation delay is twice the length of
-%% the chain. It would also require, in the event of the failure of B,
-%% that C knows to directly contact A and issue the necessary
-%% replies. Instead, the chain forms a ring: C sends the message on to
-%% A: C does not distinguish A as the sender, merely as the next
-%% member within the chain. When A receives from C messages that A
-%% sent, it knows that all participants have received the
-%% message. However, the message is not dead yet: if C died as B was
-%% sending to C, then B would need to detect the death of C and
-%% forward the message on to A instead: thus every node has to
-%% remember every message published to it until it is told that it can
-%% forget about the message. This is essential not just for dealing
-%% with failure of members, but also for the addition of new members.
+%% communication between joined group members is asynchronous. In the
+%% chain A -> B -> C -> D, if A sends a message to the group, it will
+%% not directly contact C or D. However, it must know that D receives
+%% the message (in addition to B and C) before it can consider the
+%% message fully sent. A simplistic implementation would require that
+%% D replies to C, C replies to B and B then replies to A. This would
+%% result in a propagation delay of twice the length of the chain. It
+%% would also require, in the event of the failure of C, that C knows
+%% to directly contact B and issue the necessary replies. Instead, the
+%% chain forms a ring: D sends the message on to A: D does not
+%% distinguish A as the sender, merely as the next member (downstream)
+%% within the chain. When A receives from D messages that A sent, it
+%% knows that all members have received the message. However, the
+%% message is not dead yet: if C died as B was sending to C, then B
+%% would need to detect the death of C and forward the message on to D
+%% instead: thus every node has to remember every message published
+%% until it is told that it can forget about the message. This is
+%% essential not just for dealing with failure of members, but also
+%% for the addition of new members.
 %%
 %% Thus once A receives the message back again, it then sends to B an
 %% acknowledgement for the message, indicating that B can now forget
 %% about the message. B does so, and forwards the ack to C. C forgets
-%% the message, and forwards the ack back to A. At this point, A takes
-%% no further action: the message and its acknowledgement have made it
-%% to every member of the group. The message is now dead, and any new
+%% the message, and forwards the ack to D, which forgets the message
+%% and finally forwards the ack back to A. At this point, A takes no
+%% further action: the message and its acknowledgement have made it to
+%% every member of the group. The message is now dead, and any new
 %% member joining the group at this point will not receive the
 %% message.
 %%
@@ -138,7 +150,185 @@
 %% 2. The other group members who upon receiving messages and
 %% acknowledgements must update their own internal state accordingly
 %% (the sending member must also do this in order to be able to
-%% accomodate failures).
+%% accomodate failures), and forwards messages on to their downstream
+%% neighbours.
+%%
+%%
+%% Implementation: It gets trickier
+%% --------------------------------
+%%
+%% Chain A -> B -> C -> D
+%%
+%% A publishes a message which B receives. A now dies. B and D will
+%% detect the death of A, and will link up, thus the chain is now B ->
+%% C -> D. B forwards A's message on to C, who forwards it to D, who
+%% forwards it to B. Thus B is now responsible for A's messages - both
+%% publications and acknowledgements that were in flight at the point
+%% at which A died. Even worse is that this is transitive: after B
+%% forwards A's message to C, B dies as well. Now C is not only
+%% responsible for B's in-flight messages, but is also responsible for
+%% A's in-flight messages.
+%%
+%% Lemma 1: A member can only determine which dead members they have
+%% inherited responsibility for if there is a total ordering on the
+%% conflicting additions and subtractions of members from the group.
+%%
+%% Consider the simultaneous death of B and addition of B' that
+%% transitions a chain from A -> B -> C to A -> B' -> C. Either B' or
+%% C is responsible for in-flight messages from B. It is easy to
+%% ensure that at least one of them thinks they have inherited B, but
+%% if we do not ensure that exactly one of them inherits B, then we
+%% could have B' converting publishes to acks, which then will crash C
+%% as C does not believe it has issued acks for those messages.
+%%
+%% More complex scenarios are easy to concoct: A -> B -> C -> D -> E
+%% becoming A -> C' -> E. Who has inherited which of B, C and D?
+%%
+%% However, for non-conflicting membership changes, only a partial
+%% ordering is required. For example, A -> B -> C becoming A -> A' ->
+%% B. The addition of A', between A and B can have no conflicts with
+%% the death of C: it is clear that A has inherited C's messages.
+%%
+%% For ease of implementation, we adopt the simple solution, of
+%% imposing a total order on all membership changes.
+%%
+%% On the death of a member, it is ensured the dead member's
+%% neighbours become aware of the death, and the upstream neighbour
+%% now sends to its new downstream neighbour its state, including the
+%% messages pending acknowledgement. The downstream neighbour can then
+%% use this to calculate which publishes and acknowledgements it has
+%% missed out on, due to the death of its old upstream. Thus the
+%% downstream can catch up, and continues the propagation of messages
+%% through the group.
+%%
+%% Lemma 2: When a member is joining, it must synchronously
+%% communicate with its upstream member in order to receive its
+%% starting state atomically with its addition to the group.
+%%
+%% New members must start with the same state as their nearest
+%% upstream neighbour. This ensures that it is not surprised by
+%% acknowledgements they are sent, and that should their downstream
+%% neighbour die, they are able to send the correct state to their new
+%% downstream neighbour to ensure it can catch up. Thus in the
+%% transition A -> B -> C becomes A -> A' -> B -> C becomes A -> A' ->
+%% C, A' must start with the state of A, so that it can send C the
+%% correct state when B dies, allowing C to detect any missed
+%% messages.
+%%
+%% If A' starts by adding itself to the group membership, A could then
+%% die, without A' having received the necessary state from A. This
+%% would leave A' responsible for in-flight messages from A, but
+%% having the least knowledge of all, of those messages. Thus A' must
+%% start by synchronously calling A, which then immediately sends A'
+%% back its state. A then adds A' to the group. If A dies at this
+%% point then A' will be able to see this (as A' will fail to appear
+%% in the group membership), and thus A' will ignore the state it
+%% receives from A, and will simply repeat the process, trying to now
+%% join downstream from some other member. This ensures that should
+%% the upstream die as soon as the new member has been joined, the new
+%% member is guaranteed to receive the correct state, allowing it to
+%% correctly process messages inherited due to the death of its
+%% upstream neighbour.
+%%
+%% The canonical definition of the group membership is held by a
+%% distributed database. Whilst this allows the total ordering of
+%% changes to be achieved, it is nevertheless undesirable to have to
+%% query this database for the current view, upon receiving each
+%% message. Instead, we wish for members to be able to cache a view of
+%% the group membership, which then requires a cache invalidation
+%% mechanism. Each member maintains its own view of the group
+%% membership. Thus when the group's membership changes, members may
+%% need to become aware of such changes in order to be able to
+%% accurately process messages they receive. Because of the
+%% requirement of a total ordering of conflicting membership changes,
+%% it is not possible to use the guaranteed broadcast mechanism to
+%% communicate these changes: to achieve the necessary ordering, it
+%% would be necessary for such messages to be published by exactly one
+%% member, which can not be guaranteed given that such a member could
+%% die.
+%%
+%% The total ordering we enforce on membership changes gives rise to a
+%% view version number: every change to the membership creates a
+%% different view, and the total ordering permits a simple
+%% monotonically increasing view version number.
+%%
+%% Lemma 3: If a message is sent from a member that holds view version
+%% N, it can be correctly processed by any member receiving the
+%% message with a view version >= N.
+%%
+%% Initially, let us suppose that each view contains the ordering of
+%% every member that was ever part of the group. Dead members are
+%% marked as such. Thus we have a ring of members, some of which are
+%% dead, and are thus inherited by the nearest alive downstream
+%% member.
+%%
+%% In the chain A -> B -> C, all three members initially have view
+%% version 1, which reflects reality. B publishes a message, which is
+%% forward by C to A. B now dies, which A notices very quickly. Thus A
+%% updates the view, creating version 2. It now forwards B's
+%% publication, sending that message to its new downstream neighbour,
+%% C. This happens before C is aware of the death of B. C must become
+%% aware of the view change before it interprets the message its
+%% received, otherwise it will fail to learn of the death of B, and
+%% thus will not realise it has inherited B's messages (and will
+%% likely crash).
+%%
+%% Thus very simply, we have that each subsequent view contains more
+%% information than the preceeding view.
+%%
+%% However, to avoid the views growing indefinitely, we need to be
+%% able to delete members which have died _and_ for which no messages
+%% are in-flight. This requires that upon inheriting a dead member, we
+%% know the last publication sent by the dead member (this is easy: we
+%% inherit a member because we are the nearest downstream member which
+%% implies that we know at least as much than everyone else about the
+%% publications of the dead member), and we know the earliest message
+%% for which the acknowledgment is still in flight.
+%%
+%% In the chain A -> B -> C, when B dies, A will send to C its state
+%% (as C is the new downstream from A), allowing C to calculate which
+%% messages it has missed out on (described above). At this point, C
+%% also inherits B's messages. If that state from A also includes the
+%% last message published by B for which an acknowledgment has been
+%% seen, then C knows exactly which further acknowledgments it must
+%% receive (also including issuing acknowledgements for publications
+%% still in-flight that it receives), after which it is known there
+%% are no more messages in flight for B, thus all evidence that B was
+%% ever part of the group can be safely removed from the canonical
+%% group membership.
+%%
+%% Thus, for every message that a member sends, it includes with that
+%% message its view version. When a member receives a message it will
+%% update its view from the canonical copy, should its view be older
+%% than the view version included in the message it has received.
+%%
+%% The state held by each member therefore includes the messages from
+%% each publisher pending acknowledgement, the last publication seen
+%% from that publisher, and the last acknowledgement from that
+%% publisher. In the case of the member's own publications or
+%% inherited members, this last acknowledgement seen state indicates
+%% the last acknowledgement retired, rather than sent.
+%%
+%%
+%% Proof sketch
+%% ------------
+%%
+%% We need to prove that with the provided operational semantics, we
+%% can never reach a state that is not well formed from a well-formed
+%% starting state.
+%%
+%% Operational semantics (small step): straight-forward message
+%% sending, process monitoring, state updates.
+%%
+%% Well formed state: dead members inherited by exactly one non-dead
+%% member; for every entry in anyone's pending-acks, either (the
+%% publication of the message is in-flight downstream from the member
+%% and upstream from the publisher) or (the acknowledgement of the
+%% message is in-flight downstream from the publisher and upstream
+%% from the member).
+%%
+%% Proof by induction on the applicable operational semantics.
+
 
 -behaviour(gen_server2).
 
