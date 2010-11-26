@@ -21,15 +21,30 @@
 
 -behaviour(gm).
 
+-include("gm_specs.hrl").
+
 get_state() ->
-    get(?MODULE).
+    get(state).
 
 with_state(Fun) ->
-    put(?MODULE, Fun(get_state())).
+    put(state, Fun(get_state())).
+
+inc() ->
+    case 1 + get(count) of
+        100000 -> Now = os:timestamp(),
+                  Start = put(ts, Now),
+                  Diff = timer:now_diff(Now, Start),
+                  Rate = 100000 / (Diff / 1000000),
+                  io:format("~p seeing ~p msgs/sec~n", [self(), Rate]),
+                  put(count, 0);
+        N      -> put(count, N)
+    end.
 
 joined([Members]) ->
     io:format("Joined ~p (~p members)~n", [self(), length(Members)]),
-    put(?MODULE, dict:new()),
+    put(state, dict:from_list([{Member, empty} || Member <- Members])),
+    put(count, 0),
+    put(ts, os:timestamp()),
     ok.
 
 members_changed(Births, Deaths) ->
@@ -43,18 +58,19 @@ members_changed(Births, Deaths) ->
                     end, State, Births),
               lists:foldl(
                 fun (Died, StateN) ->
+                        true = dict:is_key(Died, StateN),
                         dict:erase(Died, StateN)
                 end, State1, Deaths)
       end),
     ok.
 
 handle_msg(From, {test_msg, Num}) ->
+    inc(),
     with_state(
       fun (State) ->
               ok = case dict:find(From, State) of
                        {ok, empty} -> ok;
                        {ok, Num}   -> ok;
-                       error       -> ok;
                        {ok, Num1} when Num < Num1 ->
                            exit({{from, From},
                                  {duplicate_delivery_of, Num1},

@@ -17,6 +17,7 @@
 -module(gm).
 
 %% Guaranteed Multicast
+%% ====================
 %%
 %% This module provides the ability to create named groups of
 %% processes to which members can be dynamically added and removed,
@@ -34,7 +35,45 @@
 %% members, provided the new members have joined before the message
 %% has reached all members of the group.
 %%
+%%
+%% API Use
+%% -------
+%%
+%% Mnesia must be started. Use the idempotent create_tables/0 function
+%% to create the tables required.
+%%
+%% start_link/3
+%% Provide the group name, the callback module name, and a list of any
+%% arguments you wish to be passed into the callback module's
+%% joined/1. The joined/1 will be called when we have joined the
+%% group, and the list of arguments will have appended to it a list of
+%% the current members of the group. See the comments in
+%% behaviour_info/1 below for further details of the callback
+%% functions.
+%%
+%% leave/1
+%% Provide the Pid. Removes the Pid from the group. The callback
+%% terminate/1 function will be called.
+%%
+%% broadcast/2
+%% Provide the Pid and a Message. The message will be sent to all
+%% members of the group as per the guarantees given above. This is a
+%% cast and the function call will return immediately. There is no
+%% guarantee that the message will reach any member of the group.
+%%
+%% confirmed_broadcast/2
+%% Provide the Pid and a Message. As per broadcast/2 except that this
+%% is a call, not a cast, and only returns 'ok' once the Message has
+%% reached every member of the group. Do not call
+%% confirmed_broadcast/2 directly from the callback module otherwise
+%% you will deadlock the entire group.
+%%
+%% group_members/1
+%% Provide the Pid. Returns a list of the current group members.
+%%
+%%
 %% Implementation Overview
+%% -----------------------
 %%
 %% One possible means of implementation would be a fanout from the
 %% sender to every member of the group. This would require that the
@@ -142,6 +181,22 @@
                          {attributes, record_info(fields, gm_group)}]}
         ]).
 
+-ifdef(use_specs).
+
+-export_type([group_name/0]).
+
+-type(group_name() :: any()).
+
+-spec(create_tables/0 :: () -> 'ok').
+-spec(start_link/3 :: (group_name(), atom(), [any()]) ->
+                           {'ok', pid()} | {'error', any()}).
+-spec(leave/1 :: (pid()) -> 'ok').
+-spec(broadcast/2 :: (pid(), any()) -> 'ok').
+-spec(confirmed_broadcast/2 :: (pid(), any()) -> 'ok').
+-spec(group_members/1 :: (pid()) -> [pid()]).
+
+-endif.
+
 behaviour_info(callbacks) ->
     [
      %% Called when we've successfully joined the group. Supplied with
@@ -151,13 +206,23 @@ behaviour_info(callbacks) ->
 
      %% Called when the members have changed. First arg is the list of
      %% new members. Second arg is the list of members previously
-     %% known to us that have since died.
+     %% known to us that have since died. Note that if a member joins
+     %% and dies very quickly, it's possible that we will never see
+     %% that member appear in either argument. However we are
+     %% guaranteed that (1) we will see a member joining either in the
+     %% first argument here, or in the argument to joined/1 before
+     %% receiving any messages from it; and (2) we will not see
+     %% members die that we have not seen born (or supplied in the
+     %% argument to joined/1).
      {members_changed, 2},
 
      %% Called with each new message received from other
      %% members. First arg is the sender. Second arg is the
-     %% message. This does not get called for messages injected by
-     %% this member.
+     %% message. This does get called for messages injected by this
+     %% member, however, in such cases, there is no special
+     %% significance of this call: it does not indicate that the
+     %% message has made it to any other members, let alone all other
+     %% members.
      {handle_msg, 2},
 
      %% Called on gm member termination as per rules in gen_server
@@ -299,7 +364,7 @@ handle_cast(join, State = #state { self        = Self,
     View = join_group(Self, GroupName),
     State1 = check_neighbours(State #state { view = View }),
     handle_callback_result(
-      {Module:joined(Args ++ [alive_view_members(View)]), State1});
+      {Module:joined(Args ++ [all_known_members(View)]), State1});
 
 handle_cast(leave, State) ->
     {stop, normal, State}.
@@ -522,6 +587,12 @@ blank_view(Ver) ->
 
 alive_view_members({_Ver, View}) ->
     dict:fetch_keys(View).
+
+all_known_members({_Ver, View}) ->
+    dict:fold(
+      fun (Member, #view_member { aliases = Aliases }, Acc) ->
+              ?SETS:to_list(Aliases) ++ [Member | Acc]
+      end, [], View).
 
 group_to_view(#gm_group { members = Members, version = Ver }) ->
     Alive = lists:filter(fun is_member_alive/1, Members),
@@ -899,10 +970,10 @@ callback(Module, Activity) ->
       end, ok, Activity).
 
 callback_view_changed(Module, OldView, NewView) ->
-    OldAlive = alive_view_members(OldView),
-    NewAlive = alive_view_members(NewView),
-    Births = NewAlive -- OldAlive,
-    Deaths = OldAlive -- NewAlive,
+    OldMembers = all_known_members(OldView),
+    NewMembers = all_known_members(NewView),
+    Births = NewMembers -- OldMembers,
+    Deaths = OldMembers -- NewMembers,
     case {Births, Deaths} of
         {[], []} ->
             ok;
