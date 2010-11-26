@@ -26,14 +26,17 @@
 %% the message. The lifetime of a message is defined as being, at a
 %% minimum, the time from which the message is first sent to any
 %% member of the group, up until the time at which it is known by the
-%% member who created the message that the message has reached all
+%% member who published the message that the message has reached all
 %% group members.
 %%
 %% The guarantee given is that provided a message, once sent, makes it
 %% to members who do not all leave the group, the message will
-%% continue to propogate to all group members, including new group
-%% members, provided the new members have joined before the message
-%% has reached all members of the group.
+%% continue to propogate to all group members.
+%%
+%% Another way of stating the guarantee is that if member P publishes
+%% messages m and m', then for all members P', if P' is a member of
+%% the group prior to the publication of m, and P' receives m', then
+%% P' will receive m.
 %%
 %% Note that only local-ordering is enforced: i.e. if member P sends
 %% message m and then message m', then forall members P', if P'
