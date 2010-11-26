@@ -215,13 +215,14 @@ handle_call({confirmed_broadcast, _Msg}, _From,
             State = #state { members_state = undefined }) ->
     reply(not_joined, State);
 
-handle_call({confirmed_broadcast, _Msg}, _From,
-            State = #state { self  = Self,
-                             right = {Self, undefined} }) ->
-    reply(ok, State);
+handle_call({confirmed_broadcast, Msg}, _From,
+            State = #state { self   = Self,
+                             right  = {Self, undefined},
+                             module = Module }) ->
+    handle_callback_result({Module:handle_msg(Self, Msg), ok, State});
 
 handle_call({confirmed_broadcast, Msg}, From, State) ->
-    noreply(internal_broadcast(Msg, From, State));
+    internal_broadcast(Msg, From, State);
 
 handle_call(group_members, _From,
             State = #state { members_state = undefined }) ->
@@ -280,14 +281,16 @@ handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
         _  -> handle_callback_result({Result, State1})
     end;
 
-handle_cast({broadcast, _Msg}, State = #state { self          = Self,
-                                                right         = Right,
-                                                members_state = MembersState })
-  when Right =:= {Self, undefined} orelse MembersState =:= undefined ->
+handle_cast({broadcast, _Msg}, State = #state { members_state = undefined }) ->
     noreply(State);
 
+handle_cast({broadcast, Msg}, State = #state { self   = Self,
+                                               right  = {Self, undefined},
+                                               module = Module }) ->
+    handle_callback_result({Module:handle_msg(Self, Msg), State});
+
 handle_cast({broadcast, Msg}, State) ->
-    noreply(internal_broadcast(Msg, none, State));
+    internal_broadcast(Msg, none, State);
 
 handle_cast(join, State = #state { self        = Self,
                                    group_name  = GroupName,
@@ -458,11 +461,11 @@ a(#state { self = Self,
     #view_member { left = Left } = fetch_view_member(Self, View),
     ok.
 
-internal_broadcast(Msg, From,
-            State = #state { self          = Self,
-                             pub_count     = PubCount,
-                             members_state = MembersState,
-                             confirms      = Confirms }) ->
+internal_broadcast(Msg, From, State = #state { self          = Self,
+                                               pub_count     = PubCount,
+                                               members_state = MembersState,
+                                               module        = Module,
+                                               confirms      = Confirms }) ->
     PubMsg = {PubCount, Msg},
     Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
     ok = maybe_send_activity(activity_finalise(Activity), State),
@@ -475,9 +478,10 @@ internal_broadcast(Msg, From,
                     none -> Confirms;
                     _    -> queue:in({PubCount, From}, Confirms)
                 end,
-    State #state { pub_count     = PubCount + 1,
-                   members_state = MembersState1,
-                   confirms      = Confirms1 }.
+    handle_callback_result({Module:handle_msg(Self, Msg),
+                            State #state { pub_count     = PubCount + 1,
+                                           members_state = MembersState1,
+                                           confirms      = Confirms1 }}).
 
 
 %% ---------------------------------------------------------------------------
