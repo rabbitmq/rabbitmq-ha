@@ -121,18 +121,18 @@
 %% message fully sent. A simplistic implementation would require that
 %% D replies to C, C replies to B and B then replies to A. This would
 %% result in a propagation delay of twice the length of the chain. It
-%% would also require, in the event of the failure of C, that C knows
+%% would also require, in the event of the failure of C, that D knows
 %% to directly contact B and issue the necessary replies. Instead, the
 %% chain forms a ring: D sends the message on to A: D does not
 %% distinguish A as the sender, merely as the next member (downstream)
-%% within the chain. When A receives from D messages that A sent, it
-%% knows that all members have received the message. However, the
-%% message is not dead yet: if C died as B was sending to C, then B
-%% would need to detect the death of C and forward the message on to D
-%% instead: thus every node has to remember every message published
-%% until it is told that it can forget about the message. This is
-%% essential not just for dealing with failure of members, but also
-%% for the addition of new members.
+%% within the chain (which has now become a ring). When A receives
+%% from D messages that A sent, it knows that all members have
+%% received the message. However, the message is not dead yet: if C
+%% died as B was sending to C, then B would need to detect the death
+%% of C and forward the message on to D instead: thus every node has
+%% to remember every message published until it is told that it can
+%% forget about the message. This is essential not just for dealing
+%% with failure of members, but also for the addition of new members.
 %%
 %% Thus once A receives the message back again, it then sends to B an
 %% acknowledgement for the message, indicating that B can now forget
