@@ -1,9 +1,9 @@
 {application, rabbit_ha,
  [{description, "Highly available queues for RabbitMQ"},
   {vsn, "%%VSN%%"},
-  {modules, [
-             gm
+  {modules, [ gm,
+              rabbit_mirror_queue_master
             ]},
-  {registered, [gm]},
+  {registered, []},
   {env, []},
   {applications, [kernel, stdlib, rabbit]}]}.
