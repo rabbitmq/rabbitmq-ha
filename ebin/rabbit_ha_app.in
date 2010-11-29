@@ -2,8 +2,8 @@
  [{description, "Highly available queues for RabbitMQ"},
   {vsn, "%%VSN%%"},
   {modules, [
-    rabbit_exchange_type_ha
-  ]},
+             gm
+            ]},
   {registered, [gm]},
   {env, []},
   {applications, [kernel, stdlib, rabbit]}]}.
