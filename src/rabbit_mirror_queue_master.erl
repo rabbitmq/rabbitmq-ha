@@ -16,7 +16,7 @@
 
 -module(rabbit_mirror_queue_master).
 
--export([init/3, terminate/1, delete_and_terminate/1,
+-export([init/2, terminate/1, delete_and_terminate/1,
          purge/1, publish/3, publish_delivered/4, fetch/2, ack/2,
          tx_publish/4, tx_ack/3, tx_rollback/2, tx_commit/4,
          requeue/3, len/1, is_empty/1, dropwhile/2,
@@ -26,15 +26,11 @@
 
 -export([start/1, stop/0]).
 
--export([joined/1, members_changed/2, handle_msg/2]).
-
 -behaviour(rabbit_backing_queue).
--behaviour(gm).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--record(state, { gm,
-                 vq }).
+-record(state, { coordinator, vq }).
 
 %% ---------------------------------------------------------------------------
 %% Backing queue
@@ -49,17 +45,16 @@ stop() ->
     %% Same as start/1.
     exit({not_valid_for_generic_backing_queue, ?MODULE}).
 
-init(#amqqueue { name = QueueName, arguments = Args, durable = IsDurable },
+init(#amqqueue { name = QueueName, arguments = Args, durable = false },
      Recover) ->
-    %% start-link up the queue coordinator
-    %% send it the necessary joins based on Args
-    #state {}.
+    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(QueueName),
+    {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
+    [rabbit_mirror_queue_coordinator:add_slave(CPid, Node) ||
+        Node <- Nodes],
+    #state { coordinator = CPid }.
 
 terminate(#state {}) ->
     %% backing queue termination
-    ok;
-terminate(Reason) ->
-    %% gm termination
     ok.
 
 delete_and_terminate(#state {} = State) ->
@@ -121,6 +116,10 @@ tx_commit(Txn, PostCommitFun, MsgPropsFun, #state {} = State) ->
     %% tx_commit_post_msg_store at the same point, and then when they
     %% all confirm that (scatter/gather), we can finally invoke the
     %% PostCommitFun.
+    %%
+    %% Another idea is that the slaves are actually driven with
+    %% pubacks and thus only the master needs to support txns
+    %% directly.
     {[], State}.
 
 requeue(AckTags, MsgPropsFun, #state {} = State) ->
@@ -150,16 +149,3 @@ handle_pre_hibernate(#state {} = State) ->
 
 status(#state {}) ->
     [].
-
-%% ---------------------------------------------------------------------------
-%% GM
-%% ---------------------------------------------------------------------------
-
-joined(Members) ->
-    ok.
-
-members_changed(Births, Deaths) ->
-    ok.
-
-handle_msg(From, Msg) ->
-    ok.

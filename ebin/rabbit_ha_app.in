@@ -2,7 +2,8 @@
  [{description, "Highly available queues for RabbitMQ"},
   {vsn, "%%VSN%%"},
   {modules, [ gm,
-              rabbit_mirror_queue_master
+              rabbit_mirror_queue_master,
+              rabbit_mirror_queue_coordinator
             ]},
   {registered, []},
   {env, []},
