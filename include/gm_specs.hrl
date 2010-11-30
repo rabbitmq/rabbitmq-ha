@@ -18,11 +18,9 @@
 
 -type(gm_callback_result() :: 'ok' | {'stop', any()}).
 
--spec(joined/1 :: ([any()]) -> gm_callback_result()).
--spec(members_changed/2 :: ([pid()], [pid()]) ->
-                                gm_callback_result()).
--spec(handle_msg/2 :: (pid(), any()) ->
-                           gm_callback_result()).
--spec(terminate/1 :: (any()) -> any()).
+-spec(joined/1          :: ([any()]) -> gm_callback_result()).
+-spec(members_changed/1 :: ([any()]) -> gm_callback_result()).
+-spec(handle_msg/1      :: ([any()]) -> gm_callback_result()).
+-spec(terminate/1       :: ([any()]) -> any()).
 
 -endif.

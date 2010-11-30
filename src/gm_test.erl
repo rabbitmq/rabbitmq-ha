@@ -17,7 +17,7 @@
 -module(gm_test).
 
 -export([test/0]).
--export([joined/1, members_changed/2, handle_msg/2, terminate/1]).
+-export([joined/1, members_changed/1, handle_msg/1, terminate/1]).
 
 -behaviour(gm).
 
@@ -47,7 +47,7 @@ joined([Members]) ->
     put(ts, os:timestamp()),
     ok.
 
-members_changed(Births, Deaths) ->
+members_changed([Births, Deaths]) ->
     with_state(
       fun (State) ->
               State1 =
@@ -64,7 +64,7 @@ members_changed(Births, Deaths) ->
       end),
     ok.
 
-handle_msg(From, {test_msg, Num}) ->
+handle_msg([From, {test_msg, Num}]) ->
     inc(),
     with_state(
       fun (State) ->
@@ -84,7 +84,7 @@ handle_msg(From, {test_msg, Num}) ->
       end),
     ok.
 
-terminate(Reason) ->
+terminate([Reason]) ->
     io:format("Left ~p (~p)~n", [self(), Reason]),
     ok.
 

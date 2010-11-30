@@ -21,7 +21,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--export([joined/1, members_changed/2, handle_msg/2, terminate/1]).
+-export([joined/1, members_changed/1, handle_msg/1, terminate/1]).
 
 -behaviour(gen_server2).
 -behaviour(gm).
@@ -77,13 +77,13 @@ joined([CPid, Members]) ->
     CPid ! {joined, self(), Members},
     ok.
 
-members_changed(Births, Deaths) ->
+members_changed([CPid, Births, Deaths]) ->
     ok.
 
-handle_msg(From, Msg) ->
+handle_msg([CPid, From, Msg]) ->
     ok.
 
-terminate(Reason) ->
+terminate([CPid, Reason]) ->
     ok.
 
 %% ---------------------------------------------------------------------------

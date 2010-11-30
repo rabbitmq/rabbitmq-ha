@@ -55,7 +55,7 @@
 %% start_link/3
 %% Provide the group name, the callback module name, and a list of any
 %% arguments you wish to be passed into the callback module's
-%% joined/1. The joined/1 will be called when we have joined the
+%% functions. The joined/1 will be called when we have joined the
 %% group, and the list of arguments will have appended to it a list of
 %% the current members of the group. See the comments in
 %% behaviour_info/1 below for further details of the callback
@@ -395,7 +395,7 @@
           view,
           pub_count,
           members_state,
-          joined_args,
+          callback_args,
           confirms
         }).
 
@@ -435,28 +435,32 @@ behaviour_info(callbacks) ->
      %% supplied to start_link.
      {joined, 1},
 
-     %% Called when the members have changed. First arg is the list of
-     %% new members. Second arg is the list of members previously
-     %% known to us that have since died. Note that if a member joins
-     %% and dies very quickly, it's possible that we will never see
-     %% that member appear in either argument. However we are
-     %% guaranteed that (1) we will see a member joining either in the
-     %% first argument here, or in the argument to joined/1 before
-     %% receiving any messages from it; and (2) we will not see
-     %% members die that we have not seen born (or supplied in the
-     %% argument to joined/1).
-     {members_changed, 2},
+     %% Called with a list of args when the members have changed. The
+     %% args are the list of callback args provided initially to
+     %% start_link, followed by, firstly the list of new members and
+     %% secondly the list of members previously known to us that have
+     %% since died. Note that if a member joins and dies very quickly,
+     %% it's possible that we will never see that member appear in
+     %% either argument. However we are guaranteed that (1) we will
+     %% see a member joining either in the first argument here, or in
+     %% the argument to joined/1 before receiving any messages from
+     %% it; and (2) we will not see members die that we have not seen
+     %% born (or supplied in the argument to joined/1).
+     {members_changed, 1},
 
      %% Called with each new message received from other
      %% members. First arg is the sender. Second arg is the
-     %% message. This does get called for messages injected by this
-     %% member, however, in such cases, there is no special
-     %% significance of this call: it does not indicate that the
-     %% message has made it to any other members, let alone all other
-     %% members.
-     {handle_msg, 2},
+     %% message. Both are appended to the list of callback args
+     %% supplied to start_link. This does get called for messages
+     %% injected by this member, however, in such cases, there is no
+     %% special significance of this call: it does not indicate that
+     %% the message has made it to any other members, let alone all
+     %% other members.
+     {handle_msg, 1},
 
-     %% Called on gm member termination as per rules in gen_server
+     %% Called on gm member termination as per rules in gen_server,
+     %% with the termination Reason appended to the list of callback
+     %% args.
      {terminate, 1}
     ];
 behaviour_info(_Other) ->
@@ -502,7 +506,7 @@ init([GroupName, Module, Args]) ->
                   view          = undefined,
                   pub_count     = 0,
                   members_state = undefined,
-                  joined_args   = Args,
+                  callback_args = Args,
                   confirms      = queue:new() }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
@@ -512,10 +516,11 @@ handle_call({confirmed_broadcast, _Msg}, _From,
     reply(not_joined, State);
 
 handle_call({confirmed_broadcast, Msg}, _From,
-            State = #state { self   = Self,
-                             right  = {Self, undefined},
-                             module = Module }) ->
-    handle_callback_result({Module:handle_msg(Self, Msg), ok, State});
+            State = #state { self          = Self,
+                             right         = {Self, undefined},
+                             module        = Module,
+                             callback_args = Args }) ->
+    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]), ok, State});
 
 handle_call({confirmed_broadcast, Msg}, From, State) ->
     internal_broadcast(Msg, From, State);
@@ -536,7 +541,8 @@ handle_call({add_on_right, NewMember}, _From,
                              group_name    = GroupName,
                              view          = View,
                              members_state = MembersState,
-                             module        = Module }) ->
+                             module        = Module,
+                             callback_args = Args }) ->
     Group = record_new_member_in_group(
               GroupName, Self, NewMember,
               fun (Group1) ->
@@ -547,21 +553,23 @@ handle_call({add_on_right, NewMember}, _From,
               end),
     View2 = group_to_view(Group),
     State1 = check_neighbours(State #state { view = View2 }),
-    Result = callback_view_changed(Module, View, View2),
+    Result = callback_view_changed(Args, Module, View, View2),
     handle_callback_result({Result, {ok, Group}, State1}).
 
 
-handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
-                                                  left       = {Left, _MRefL},
-                                                  right      = {Right, _MRefR},
-                                                  view       = View,
-                                                  group_name = GroupName,
-                                                  module     = Module }) ->
+handle_cast({?TAG, ReqVer, Msg},
+            State = #state { self          = Self,
+                             left          = {Left, _MRefL},
+                             right         = {Right, _MRefR},
+                             view          = View,
+                             group_name    = GroupName,
+                             module        = Module,
+                             callback_args = Args }) ->
     {Result, State1} =
         case needs_view_update(ReqVer, View) of
             true ->
                 View1 = group_to_view(read_group(GroupName)),
-                Result1 = callback_view_changed(Module, View, View1),
+                Result1 = callback_view_changed(Args, Module, View, View1),
                 State2 = State #state { view = View1 },
                 {Result1, case fetch_view_member(Self, View1) of
                               #view_member { left = Left, right = Right } ->
@@ -580,18 +588,20 @@ handle_cast({?TAG, ReqVer, Msg}, State = #state { self       = Self,
 handle_cast({broadcast, _Msg}, State = #state { members_state = undefined }) ->
     noreply(State);
 
-handle_cast({broadcast, Msg}, State = #state { self   = Self,
-                                               right  = {Self, undefined},
-                                               module = Module }) ->
-    handle_callback_result({Module:handle_msg(Self, Msg), State});
+handle_cast({broadcast, Msg},
+            State = #state { self          = Self,
+                             right         = {Self, undefined},
+                             module        = Module,
+                             callback_args = Args }) ->
+    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]), State});
 
 handle_cast({broadcast, Msg}, State) ->
     internal_broadcast(Msg, none, State);
 
-handle_cast(join, State = #state { self        = Self,
-                                   group_name  = GroupName,
-                                   module      = Module,
-                                   joined_args = Args }) ->
+handle_cast(join, State = #state { self          = Self,
+                                   group_name    = GroupName,
+                                   module        = Module,
+                                   callback_args = Args }) ->
     View = join_group(Self, GroupName),
     State1 = check_neighbours(State #state { view = View }),
     handle_callback_result(
@@ -602,11 +612,12 @@ handle_cast(leave, State) ->
 
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { left       = Left,
-                             right      = Right,
-                             group_name = GroupName,
-                             view       = View,
-                             module     = Module }) ->
+            State = #state { left          = Left,
+                             right         = Right,
+                             group_name    = GroupName,
+                             view          = View,
+                             module        = Module,
+                             callback_args = Args }) ->
     Member = case {Left, Right} of
                  {{Member1, MRef}, _} -> Member1;
                  {_, {Member1, MRef}} -> Member1;
@@ -620,12 +631,13 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
                 group_to_view(record_dead_member_in_group(Member, GroupName)),
             State1 = check_neighbours(State #state { view = View1 }),
             handle_callback_result(
-              {callback_view_changed(Module, View, View1), State1})
+              {callback_view_changed(Args, Module, View, View1), State1})
     end.
 
 
-terminate(Reason, #state { module = Module }) ->
-    Module:terminate(Reason).
+terminate(Reason, #state { module        = Module,
+                           callback_args = Args }) ->
+    Module:terminate(Args ++ [Reason]).
 
 
 code_change(_OldVsn, State, _Extra) ->
@@ -695,7 +707,8 @@ handle_msg({activity, Left, Activity},
                             module        = Module,
                             view          = View,
                             members_state = MembersState,
-                            confirms      = Confirms })
+                            confirms      = Confirms,
+                            callback_args = Args })
   when MembersState =/= undefined ->
     {MembersState1, {Confirms1, Activity1}} =
         lists:foldl(
@@ -735,7 +748,7 @@ handle_msg({activity, Left, Activity},
                             confirms      = Confirms1 },
     Activity3 = activity_finalise(Activity1),
     ok = maybe_send_activity(Activity3, State1),
-    {callback(Module, Activity3), State1};
+    {callback(Args, Module, Activity3), State1};
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
     {ok, State}.
@@ -761,7 +774,8 @@ internal_broadcast(Msg, From, State = #state { self          = Self,
                                                pub_count     = PubCount,
                                                members_state = MembersState,
                                                module        = Module,
-                                               confirms      = Confirms }) ->
+                                               confirms      = Confirms,
+                                               callback_args = Args }) ->
     PubMsg = {PubCount, Msg},
     Activity = activity_cons(Self, [PubMsg], [], activity_nil()),
     ok = maybe_send_activity(activity_finalise(Activity), State),
@@ -774,7 +788,7 @@ internal_broadcast(Msg, From, State = #state { self          = Self,
                     none -> Confirms;
                     _    -> queue:in({PubCount, From}, Confirms)
                 end,
-    handle_callback_result({Module:handle_msg(Self, Msg),
+    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]),
                             State #state { pub_count     = PubCount + 1,
                                            members_state = MembersState1,
                                            confirms      = Confirms1 }}).
@@ -1187,25 +1201,26 @@ maybe_send_activity(Activity, #state { self  = Self,
 send_right(Right, View, Msg) ->
     ok = gen_server2:cast(Right, {?TAG, view_version(View), Msg}).
 
-callback(Module, Activity) ->
+callback(Args, Module, Activity) ->
     lists:foldl(
       fun ({Id, Pubs, _Acks}, ok) ->
-              lists:foldl(
-                fun ({_PubNum, Pub}, ok) -> Module:handle_msg(Id, Pub);
-                    (_, Error)           -> Error
-                end, ok, Pubs);
+              lists:foldl(fun ({_PubNum, Pub}, ok) ->
+                                  Module:handle_msg(Args ++ [Id, Pub]);
+                              (_, Error) ->
+                                  Error
+                          end, ok, Pubs);
           (_, Error) ->
               Error
       end, ok, Activity).
 
-callback_view_changed(Module, OldView, NewView) ->
+callback_view_changed(Args, Module, OldView, NewView) ->
     OldMembers = all_known_members(OldView),
     NewMembers = all_known_members(NewView),
     Births = NewMembers -- OldMembers,
     Deaths = OldMembers -- NewMembers,
     case {Births, Deaths} of
         {[], []} -> ok;
-        _        -> Module:members_changed(Births, Deaths)
+        _        -> Module:members_changed(Args ++ [Births, Deaths])
     end.
 
 handle_callback_result({ok, State}) ->
