@@ -40,14 +40,14 @@ inc() ->
         N      -> put(count, N)
     end.
 
-joined([Members]) ->
+joined(#gm_joined { members = Members }) ->
     io:format("Joined ~p (~p members)~n", [self(), length(Members)]),
     put(state, dict:from_list([{Member, empty} || Member <- Members])),
     put(count, 0),
     put(ts, os:timestamp()),
     ok.
 
-members_changed([Births, Deaths]) ->
+members_changed(#gm_members_changed { births = Births, deaths = Deaths }) ->
     with_state(
       fun (State) ->
               State1 =
@@ -64,7 +64,7 @@ members_changed([Births, Deaths]) ->
       end),
     ok.
 
-handle_msg([From, {test_msg, Num}]) ->
+handle_msg(#gm_handle_msg { from = From, msg = {test_msg, Num} }) ->
     inc(),
     with_state(
       fun (State) ->
@@ -84,7 +84,7 @@ handle_msg([From, {test_msg, Num}]) ->
       end),
     ok.
 
-terminate([Reason]) ->
+terminate(#gm_terminate { reason = Reason }) ->
     io:format("Left ~p (~p)~n", [self(), Reason]),
     ok.
 

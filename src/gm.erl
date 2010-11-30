@@ -405,6 +405,8 @@
 
 -record(member, { pending_ack, last_pub, last_ack }).
 
+-include("gm.hrl").
+
 -define(TAG, '$gm').
 
 -define(TABLES,
@@ -431,27 +433,24 @@
 behaviour_info(callbacks) ->
     [
      %% Called when we've successfully joined the group. Supplied with
-     %% the known members of the group, appended to the list of args
-     %% supplied to start_link.
+     %% a #gm_joined record.
      {joined, 1},
 
-     %% Called with a list of args when the members have changed. The
-     %% args are the list of callback args provided initially to
-     %% start_link, followed by, firstly the list of new members and
-     %% secondly the list of members previously known to us that have
-     %% since died. Note that if a member joins and dies very quickly,
-     %% it's possible that we will never see that member appear in
-     %% either argument. However we are guaranteed that (1) we will
-     %% see a member joining either in the first argument here, or in
-     %% the argument to joined/1 before receiving any messages from
-     %% it; and (2) we will not see members die that we have not seen
-     %% born (or supplied in the argument to joined/1).
+     %% Called a #gm_members_changed record including the list of
+     %% callback args provided initially to start_link, the list of
+     %% new members and the list of members previously known to us
+     %% that have since died. Note that if a member joins and dies
+     %% very quickly, it's possible that we will never see that member
+     %% appear in either births or deaths. However we are guaranteed
+     %% that (1) we will see a member joining either in the births
+     %% here, or in the members passed to joined/1 before receiving
+     %% any messages from it; and (2) we will not see members die that
+     %% we have not seen born (or supplied in the members to
+     %% joined/1).
      {members_changed, 1},
 
-     %% Called with each new message received from other
-     %% members. First arg is the sender. Second arg is the
-     %% message. Both are appended to the list of callback args
-     %% supplied to start_link. This does get called for messages
+     %% Called with each new message received from other members in a
+     %% #gm_handle_msg record. This does get called for messages
      %% injected by this member, however, in such cases, there is no
      %% special significance of this call: it does not indicate that
      %% the message has made it to any other members, let alone all
@@ -459,8 +458,7 @@ behaviour_info(callbacks) ->
      {handle_msg, 1},
 
      %% Called on gm member termination as per rules in gen_server,
-     %% with the termination Reason appended to the list of callback
-     %% args.
+     %% with the termination Reason within a #gm_terminate record.
      {terminate, 1}
     ];
 behaviour_info(_Other) ->
@@ -520,7 +518,10 @@ handle_call({confirmed_broadcast, Msg}, _From,
                              right         = {Self, undefined},
                              module        = Module,
                              callback_args = Args }) ->
-    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]), ok, State});
+    handle_callback_result({Module:handle_msg(#gm_handle_msg { args = Args,
+                                                               from = Self,
+                                                               msg  = Msg }),
+                            ok, State});
 
 handle_call({confirmed_broadcast, Msg}, From, State) ->
     internal_broadcast(Msg, From, State);
@@ -593,7 +594,10 @@ handle_cast({broadcast, Msg},
                              right         = {Self, undefined},
                              module        = Module,
                              callback_args = Args }) ->
-    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]), State});
+    handle_callback_result({Module:handle_msg(#gm_handle_msg { args = Args,
+                                                               from = Self,
+                                                               msg  = Msg }),
+                            State});
 
 handle_cast({broadcast, Msg}, State) ->
     internal_broadcast(Msg, none, State);
@@ -605,7 +609,8 @@ handle_cast(join, State = #state { self          = Self,
     View = join_group(Self, GroupName),
     State1 = check_neighbours(State #state { view = View }),
     handle_callback_result(
-      {Module:joined(Args ++ [all_known_members(View)]), State1});
+      {Module:joined(#gm_joined { args    = Args,
+                                  members = all_known_members(View) }), State1});
 
 handle_cast(leave, State) ->
     {stop, normal, State}.
@@ -637,7 +642,7 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
 
 terminate(Reason, #state { module        = Module,
                            callback_args = Args }) ->
-    Module:terminate(Args ++ [Reason]).
+    Module:terminate(#gm_terminate { args = Args, reason = Reason }).
 
 
 code_change(_OldVsn, State, _Extra) ->
@@ -788,7 +793,9 @@ internal_broadcast(Msg, From, State = #state { self          = Self,
                     none -> Confirms;
                     _    -> queue:in({PubCount, From}, Confirms)
                 end,
-    handle_callback_result({Module:handle_msg(Args ++ [Self, Msg]),
+    handle_callback_result({Module:handle_msg(#gm_handle_msg { args = Args,
+                                                               from = Self,
+                                                               msg  = Msg }),
                             State #state { pub_count     = PubCount + 1,
                                            members_state = MembersState1,
                                            confirms      = Confirms1 }}).
@@ -1205,7 +1212,10 @@ callback(Args, Module, Activity) ->
     lists:foldl(
       fun ({Id, Pubs, _Acks}, ok) ->
               lists:foldl(fun ({_PubNum, Pub}, ok) ->
-                                  Module:handle_msg(Args ++ [Id, Pub]);
+                                  Module:handle_msg(
+                                    #gm_handle_msg { args = Args,
+                                                     from = Id,
+                                                     msg  = Pub });
                               (_, Error) ->
                                   Error
                           end, ok, Pubs);
@@ -1220,7 +1230,10 @@ callback_view_changed(Args, Module, OldView, NewView) ->
     Deaths = OldMembers -- NewMembers,
     case {Births, Deaths} of
         {[], []} -> ok;
-        _        -> Module:members_changed(Args ++ [Births, Deaths])
+        _        -> Module:members_changed(#gm_members_changed {
+                                              args   = Args,
+                                              births = Births,
+                                              deaths = Deaths })
     end.
 
 handle_callback_result({ok, State}) ->

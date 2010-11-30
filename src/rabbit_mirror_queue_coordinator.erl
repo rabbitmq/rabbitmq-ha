@@ -27,6 +27,7 @@
 -behaviour(gm).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
+-include("gm_specs.hrl").
 
 -record(state, { name,
                  gm
@@ -73,17 +74,18 @@ code_change(_OldVsn, State, _Extra) ->
 %% GM
 %% ---------------------------------------------------------------------------
 
-joined([CPid, Members]) ->
+joined(#gm_joined { args = [CPid], members = Members }) ->
     CPid ! {joined, self(), Members},
     ok.
 
-members_changed([CPid, Births, Deaths]) ->
+members_changed(#gm_members_changed {
+                   args = [CPid], births = Births, deaths = Deaths }) ->
     ok.
 
-handle_msg([CPid, From, Msg]) ->
+handle_msg(#gm_handle_msg { args = [CPid], from = From, msg = Msg }) ->
     ok.
 
-terminate([CPid, Reason]) ->
+terminate(#gm_terminate { args = [CPid], reason = Reason }) ->
     ok.
 
 %% ---------------------------------------------------------------------------
