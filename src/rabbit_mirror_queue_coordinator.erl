@@ -42,7 +42,7 @@ add_slave(CPid, SlaveNode) ->
 %% gen_server
 %% ---------------------------------------------------------------------------
 
-init([QueueName, Args]) ->
+init([QueueName]) ->
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
     receive {joined, GM, _Members} ->
@@ -56,6 +56,7 @@ handle_call(Msg, _From, State) ->
     {stop, {unexpected_call, Msg}, State}.
 
 handle_cast({add_slave, Node}, State = #state { name = QueueName }) ->
+    io:format("Add Slave '~p'~n", [Node]),
     {ok, SPid} = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
     noreply(State).
 

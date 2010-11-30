@@ -24,7 +24,7 @@
 
 -behaviour(supervisor2).
 
--export([start/1, start_link/0, start_child/2]).
+-export([start/0, start_link/0, start_child/2]).
 
 -export([init/1]).
 
@@ -32,7 +32,7 @@
 
 -define(SERVER, ?MODULE).
 
-start([]) ->
+start() ->
     {ok, _} =
         supervisor:start_child(
           rabbit_sup,

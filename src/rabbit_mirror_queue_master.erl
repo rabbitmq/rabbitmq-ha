@@ -49,8 +49,8 @@ init(#amqqueue { name = QueueName, arguments = Args, durable = false },
      Recover) ->
     {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(QueueName),
     {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
-    [rabbit_mirror_queue_coordinator:add_slave(CPid, Node) ||
-        Node <- Nodes],
+    [rabbit_mirror_queue_coordinator:add_slave(CPid, binary_to_atom(Node, utf8))
+     || {longstr, Node} <- Nodes],
     #state { coordinator = CPid }.
 
 terminate(#state {}) ->

@@ -51,7 +51,7 @@ handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
 
 handle_call({deliver, Txn, Message, ChPid}, _From, State) ->
     %% Synchronous, "mandatory" delivery mode
-    fix_me;
+    fix_me.
 
 handle_cast({deliver, Txn, Message, ChPid}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
