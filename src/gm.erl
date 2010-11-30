@@ -696,12 +696,8 @@ handle_msg({catchup, Left, MembersStateLeft},
                             end
                     end, Id, MembersStateActivity)
           end, {MembersState, activity_nil()}, AllMembers),
-    {Result, State1} =
-        handle_msg({activity, Left, activity_finalise(Activity)},
-                   State #state { members_state = MembersState1 }),
-    %% we can only tidy up when we know we've receive all pubs for
-    %% inherited members
-    {Result, maybe_erase_aliases(State1)};
+    handle_msg({activity, Left, activity_finalise(Activity)},
+               State #state { members_state = MembersState1 });
 
 handle_msg({catchup, _NotLeft, _MembersState}, State) ->
     {ok, State};
@@ -753,7 +749,7 @@ handle_msg({activity, Left, Activity},
                             confirms      = Confirms1 },
     Activity3 = activity_finalise(Activity1),
     ok = maybe_send_activity(Activity3, State1),
-    {callback(Args, Module, Activity3), State1};
+    {callback(Args, Module, Activity3), maybe_erase_aliases(State1)};
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
     {ok, State}.
