@@ -14,9 +14,9 @@
 %% Copyright (c) 2007-2010 VMware, Inc.  All rights reserved.
 %%
 
--module(rabbit_mirror_queue_coordinator).
+-module(rabbit_mirror_queue_slave).
 
--export([start_link/1, add_slave/2]).
+-export([start_link/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -35,29 +35,33 @@
 start_link(QueueName) ->
     gen_server2:start_link(?MODULE, [QueueName], []).
 
-add_slave(CPid, SlaveNode) ->
-    gen_server2:cast(CPid, {add_slave, SlaveNode}).
-
-%% ---------------------------------------------------------------------------
-%% gen_server
-%% ---------------------------------------------------------------------------
-
-init([QueueName, Args]) ->
+init([QueueName]) ->
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
     receive {joined, GM, _Members} ->
             ok
     end,
-    {ok, #state { name   = QueueName,
-                  gm     = GM }, hibernate,
+    {ok, #state { name = QueueName,
+                  gm   = GM }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
-handle_call(Msg, _From, State) ->
-    {stop, {unexpected_call, Msg}, State}.
+handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
+    %% Synchronous, "immediate" delivery mode
+    fix_me;
 
-handle_cast({add_slave, Node}, State = #state { name = QueueName }) ->
-    {ok, SPid} = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
-    noreply(State).
+handle_call({deliver, Txn, Message, ChPid}, _From, State) ->
+    %% Synchronous, "mandatory" delivery mode
+    fix_me;
+
+handle_call(info, _From, State) ->
+    reply('', State);
+
+handle_call({info, Items}, _From, State) ->
+    reply({ok, ''}, State).
+
+handle_cast({deliver, Txn, Message, ChPid}, State) ->
+    %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
+    fix_me.
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
@@ -72,8 +76,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% GM
 %% ---------------------------------------------------------------------------
 
-joined([CPid, Members]) ->
-    CPid ! {joined, self(), Members},
+joined([SPid, Members]) ->
+    SPid ! {joined, self(), Members},
     ok.
 
 members_changed(Births, Deaths) ->

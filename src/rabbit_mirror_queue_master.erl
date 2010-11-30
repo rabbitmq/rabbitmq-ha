@@ -17,8 +17,8 @@
 -module(rabbit_mirror_queue_master).
 
 -export([init/2, terminate/1, delete_and_terminate/1,
-         purge/1, publish/3, publish_delivered/4, fetch/2, ack/2,
-         tx_publish/4, tx_ack/3, tx_rollback/2, tx_commit/4,
+         purge/1, publish/4, publish_delivered/5, fetch/2, ack/2,
+         tx_publish/5, tx_ack/3, tx_rollback/2, tx_commit/4,
          requeue/3, len/1, is_empty/1, dropwhile/2,
          set_ram_duration_target/2, ram_duration/1,
          needs_idle_timeout/1, idle_timeout/1, handle_pre_hibernate/1,
@@ -64,12 +64,12 @@ purge(#state {} = State) ->
     %% get count and gm:broadcast(GM, {drop_next, Count})
     {0, State}.
 
-publish(Msg, MsgProps, #state {} = State) ->
-    %% gm:broadcast(GM, {publish, Guid, MsgProps})
+publish(Msg, MsgProps, ChPid, #state {} = State) ->
+    %% gm:broadcast(GM, {publish, Guid, MsgProps, ChPid})
     State.
 
-publish_delivered(AckRequired, Msg, MsgProps, #state {} = State) ->
-    %% gm:broadcast(GM, {publish_delivered, AckRequired, Guid, MsgProps})
+publish_delivered(AckRequired, Msg, MsgProps, ChPid, #state {} = State) ->
+    %% gm:broadcast(GM, {publish_delivered, AckRequired, Guid, MsgProps, ChPid})
     %% prefix acktag with self()
     {blank_ack, State}.
 
@@ -88,8 +88,8 @@ ack(AckTags, #state {} = State) ->
     %% drop any acktags which do not have self() prefix
     State.
 
-tx_publish(Txn, Msg, MsgProps, #state {} = State) ->
-    %% gm:broadcast(GM, {tx_publish, Txn, Guid, MsgProps})
+tx_publish(Txn, Msg, MsgProps, ChPid, #state {} = State) ->
+    %% gm:broadcast(GM, {tx_publish, Txn, Guid, MsgProps, ChPid})
     State.
 
 tx_ack(Txn, AckTags, #state {} = State) ->
