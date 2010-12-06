@@ -51,9 +51,9 @@ init([QueueName]) ->
     receive {joined, GM, _Members} ->
             ok
     end,
-    {ok, TRef} = timer:apply_interval(?ONE_SECOND, gm, broadcast, [GM, heartbeat]),
-    {ok, #state { name   = QueueName,
-                  gm     = GM }, hibernate,
+    {ok, _TRef} =
+        timer:apply_interval(?ONE_SECOND, gm, broadcast, [GM, heartbeat]),
+    {ok, #state { name = QueueName, gm = GM }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 handle_call(Msg, _From, State) ->
@@ -62,6 +62,13 @@ handle_call(Msg, _From, State) ->
 handle_cast({add_slave, Node}, State = #state { name = QueueName }) ->
     Result = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
     io:format("Add Slave '~p' => ~p~n", [Node, Result]),
+    noreply(State);
+
+handle_cast({gm_deaths, Deaths}, State = #state { gm   = GM,
+                                                  name = QueueName }) ->
+    io:format("Coord (~p) got deaths: ~p~n", [self(), Deaths]),
+    Node = node(),
+    Node = node(rabbit_mirror_queue_misc:remove_from_queue(QueueName, Deaths)),
     noreply(State).
 
 handle_info(Msg, State) ->
@@ -73,7 +80,6 @@ terminate(_Reason, State = #state{}) ->
 terminate([CPid], Reason) ->
     %% gm case
     ok.
-
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -87,8 +93,11 @@ joined([CPid], Members) ->
     ok.
 
 members_changed([CPid], Births, Deaths) ->
-    ok.
+    io:format("C: ~p ~p ~p~n", [CPid, Births, Deaths]),
+    ok = gen_server2:cast(CPid, {gm_deaths, Deaths}).
 
+handle_msg([_CPid], _From, heartbeat) ->
+    ok;
 handle_msg([CPid], From, Msg) ->
     ok.
 

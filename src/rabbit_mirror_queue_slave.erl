@@ -60,14 +60,12 @@ init([QueueName]) ->
                            {error, node_already_present}
                    end
            end) of
-        {ok, MPid} ->
-            {ok, #state { name        = QueueName,
-                          gm          = GM,
-                          master_node = node(MPid) }, hibernate,
-             {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
-              ?DESIRED_HIBERNATE}};
-        {error, node_already_present} ->
-            {stop, node_already_present}
+        {ok, MPid}     -> {ok, #state { name        = QueueName,
+                                        gm          = GM,
+                                        master_node = node(MPid) }, hibernate,
+                           {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
+                            ?DESIRED_HIBERNATE}};
+        {error, Error} -> {stop, Error}
     end.
 
 handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
@@ -84,8 +82,10 @@ handle_cast({deliver, Txn, Message, ChPid}, State) ->
 
 handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
                                                   master_node = MNode }) ->
+    io:format("Slave (~p) got deaths: ~p~n", [self(), Deaths]),
     noreply(
-      case {node(), node(remove_from_queue(QueueName, Deaths))} of
+      case {node(), node(rabbit_mirror_queue_misc:remove_from_queue(
+                           QueueName, Deaths))} of
           {_Node, MNode} ->
               State;
           {Node, Node} ->
@@ -116,9 +116,11 @@ joined([SPid], Members) ->
     ok.
 
 members_changed([SPid], Births, Deaths) ->
-    gen_server2:cast(SPid, {gm_deaths, Deaths}),
-    ok.
+    io:format("S: ~p ~p ~p~n", [SPid, Births, Deaths]),
+    ok = gen_server2:cast(SPid, {gm_deaths, Deaths}).
 
+handle_msg([_SPid], _From, heartbeat) ->
+    ok;
 handle_msg([SPid], From, Msg) ->
     ok.
 
@@ -132,26 +134,6 @@ noreply(State) ->
 reply(Reply, State) ->
     {reply, Reply, State, hibernate}.
 
-remove_from_queue(QueueName, DeadPids) ->
-    DeadNodes = [node(DeadPid) || DeadPid <- DeadPids],
-    rabbit_misc:execute_mnesia_transaction(
-      fun () ->
-              [Q = #amqqueue { pid        = QPid,
-                               extra_pids = EPids }] =
-                  mnesia:read({rabbit_queue, QueueName}),
-              [QPid1 | EPids1] =
-                  [Pid || Pid <- [QPid | EPids],
-                          not lists:member(node(Pid), DeadNodes)],
-              case {{QPid, EPids}, {QPid1, EPids1}} of
-                  {Same, Same} ->
-                      QPid;
-                  _ ->
-                      Q1 = Q #amqqueue { pid        = QPid1,
-                                         extra_pids = EPids1 },
-                      mnesia:write(rabbit_queue, Q1, write),
-                      QPid1
-              end
-      end).
-
-promote_me(#state {}) ->
+promote_me(#state { gm = GM }) ->
+    ok = gm:broadcast(GM, heartbeat),
     todo.
