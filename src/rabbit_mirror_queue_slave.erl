@@ -21,7 +21,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--export([joined/1, members_changed/1, handle_msg/1, terminate/1]).
+-export([joined/2, members_changed/3, handle_msg/3]).
 
 -behaviour(gen_server2).
 -behaviour(gm).
@@ -31,9 +31,7 @@
 
 -record(state, { name,
                  gm,
-                 master_pid,
-                 master_in_gm,
-                 promote_on_gm_death_of
+                 master_node
                }).
 
 start_link(QueueName) ->
@@ -42,27 +40,35 @@ start_link(QueueName) ->
 init([QueueName]) ->
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
-    receive {joined, GM, Members} ->
+    receive {joined, GM, Nodes} ->
             ok
     end,
     Self = self(),
-    MPid = rabbit_misc:execute_mnesia_transaction(
-             fun () ->
-                     [Q = #amqqueue { pid = QPid, extra_pids = EPids }] =
-                         mnesia:read({rabbit_queue, QueueName}),
-                     EPids1 = EPids ++ [Self],
-                     mnesia:write(rabbit_queue,
-                                  Q #amqqueue { extra_pids = EPids1 },
-                                  write),
-                     QPid
-             end),
-    erlang:monitor(process, MPid),
-    {ok, #state { name                   = QueueName,
-                  gm                     = GM,
-                  master_pid             = MPid,
-                  master_in_gm           = lists:member(MPid, Members),
-                  promote_on_gm_death_of = undefined }, hibernate,
-     {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
+    Node = node(),
+    case rabbit_misc:execute_mnesia_transaction(
+           fun () ->
+                   [Q = #amqqueue { pid = QPid, extra_pids = EPids }] =
+                       mnesia:read({rabbit_queue, QueueName}),
+                   case [Pid || Pid <- [QPid | EPids], node(Pid) =:= Node] of
+                       [] ->
+                           EPids1 = EPids ++ [Self],
+                           mnesia:write(rabbit_queue,
+                                        Q #amqqueue { extra_pids = EPids1 },
+                                        write),
+                           {ok, QPid};
+                       _ ->
+                           {error, node_already_present}
+                   end
+           end) of
+        {ok, MPid} ->
+            {ok, #state { name        = QueueName,
+                          gm          = GM,
+                          master_node = node(MPid) }, hibernate,
+             {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
+              ?DESIRED_HIBERNATE}};
+        {error, node_already_present} ->
+            {stop, node_already_present}
+    end.
 
 handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
     %% Synchronous, "immediate" delivery mode
@@ -76,36 +82,26 @@ handle_cast({deliver, Txn, Message, ChPid}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
     fix_me;
 
-handle_cast({gm_deaths, Deaths},
-            State = #state { master_pid = MPid,
-                             master_in_gm = MInGM,
-                             promote_on_gm_death_of = OldMPid }) ->
-    MNode = node(MPid),
-    MDied = lists:any(fun (Pid) -> node(Pid) =:= MNode end, Deaths),
-    MInGM1 = MInGM andalso not MDied,
-    State1 = State #state { master_in_gm = MInGM1 },
+handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
+                                                  master_node = MNode }) ->
     noreply(
-      case OldMPid of
-          undefined ->
-              State1;
-          _ ->
-              OldMNode = node(OldMPid),
-              OldMDied = lists:any(fun (Pid) -> node(Pid) =:= OldMNode end,
-                                   Deaths),
-              promote_me(OldMPid, State1)
+      case {node(), node(remove_from_queue(QueueName, Deaths))} of
+          {_Node, MNode} ->
+              State;
+          {Node, Node} ->
+              promote_me(State);
+          {_Node, MNode1} ->
+              State #state { master_node = MNode1 }
       end).
 
-handle_info({'DOWN', _MRef, process, MPid, _Reason},
-            State = #state { name       = QueueName,
-                             master_pid = MPid }) ->
-    MPid1 = remove_from_queue(QueueName, MPid),
-    State1 = State #state { master_pid = MPid1 },
-    noreply(case self() of
-                MPid1 -> promote_me(MPid, State1);
-                _     -> State1
-            end).
+handle_info(Msg, State) ->
+    {stop, {unexpected_info, Msg}, State}.
 
-terminate(_Reason, State) ->
+terminate(_Reason, State = #state {}) ->
+    %% gen_server case
+    ok;
+terminate([SPid], Reason) ->
+    %% gm case
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -115,19 +111,15 @@ code_change(_OldVsn, State, _Extra) ->
 %% GM
 %% ---------------------------------------------------------------------------
 
-joined(#gm_joined { args = [SPid], members = Members }) ->
-    SPid ! {joined, self(), Members},
+joined([SPid], Members) ->
+    SPid ! {joined, self(), [node(Pid) || Pid <- Members]},
     ok.
 
-members_changed(#gm_members_changed {
-                   args = [SPid], births = Births, deaths = Deaths }) ->
+members_changed([SPid], Births, Deaths) ->
     gen_server2:cast(SPid, {gm_deaths, Deaths}),
     ok.
 
-handle_msg(#gm_handle_msg { args = [SPid], from = From, msg = Msg }) ->
-    ok.
-
-terminate(#gm_terminate { args = [SPid], reason = Reason }) ->
+handle_msg([SPid], From, Msg) ->
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -140,23 +132,26 @@ noreply(State) ->
 reply(Reply, State) ->
     {reply, Reply, State, hibernate}.
 
-remove_from_queue(QueueName, MPid) ->
+remove_from_queue(QueueName, DeadPids) ->
+    DeadNodes = [node(DeadPid) || DeadPid <- DeadPids],
     rabbit_misc:execute_mnesia_transaction(
       fun () ->
-              [Q = #amqqueue { pid        = Pid,
-                               extra_pids = [EPid | EPids] }] =
+              [Q = #amqqueue { pid        = QPid,
+                               extra_pids = EPids }] =
                   mnesia:read({rabbit_queue, QueueName}),
-              case Pid of
-                  MPid -> Q1 = Q #amqqueue { pid        = EPid,
-                                             extra_pids = EPids },
-                          mnesia:write(rabbit_queue, Q1, write),
-                          EPid;
-                  _    -> Pid
+              [QPid1 | EPids1] =
+                  [Pid || Pid <- [QPid | EPids],
+                          not lists:member(node(Pid), DeadNodes)],
+              case {{QPid, EPids}, {QPid1, EPids1}} of
+                  {Same, Same} ->
+                      QPid;
+                  _ ->
+                      Q1 = Q #amqqueue { pid        = QPid1,
+                                         extra_pids = EPids1 },
+                      mnesia:write(rabbit_queue, Q1, write),
+                      QPid1
               end
       end).
 
-promote_me(OldMPid, State = #state { master_in_gm = true,
-                                     promote_on_gm_death_of = undefined }) ->
-    State #state { promote_on_gm_death_of = OldMPid };
-promote_me(OldMPid, State = #state { master_in_gm = false }) ->
+promote_me(#state {}) ->
     todo.

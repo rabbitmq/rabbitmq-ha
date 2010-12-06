@@ -21,7 +21,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--export([joined/1, members_changed/1, handle_msg/1, terminate/1]).
+-export([joined/2, members_changed/3, handle_msg/3]).
 
 -behaviour(gen_server2).
 -behaviour(gm).
@@ -32,6 +32,8 @@
 -record(state, { name,
                  gm
                }).
+
+-define(ONE_SECOND, 1000).
 
 start_link(QueueName) ->
     gen_server2:start_link(?MODULE, [QueueName], []).
@@ -49,6 +51,7 @@ init([QueueName]) ->
     receive {joined, GM, _Members} ->
             ok
     end,
+    {ok, TRef} = timer:apply_interval(?ONE_SECOND, gm, broadcast, [GM, heartbeat]),
     {ok, #state { name   = QueueName,
                   gm     = GM }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
@@ -57,15 +60,20 @@ handle_call(Msg, _From, State) ->
     {stop, {unexpected_call, Msg}, State}.
 
 handle_cast({add_slave, Node}, State = #state { name = QueueName }) ->
-    io:format("Add Slave '~p'~n", [Node]),
-    {ok, SPid} = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
+    Result = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
+    io:format("Add Slave '~p' => ~p~n", [Node, Result]),
     noreply(State).
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
 
-terminate(_Reason, State) ->
+terminate(_Reason, State = #state{}) ->
+    %% gen_server case
+    ok;
+terminate([CPid], Reason) ->
+    %% gm case
     ok.
+
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -74,18 +82,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% GM
 %% ---------------------------------------------------------------------------
 
-joined(#gm_joined { args = [CPid], members = Members }) ->
+joined([CPid], Members) ->
     CPid ! {joined, self(), Members},
     ok.
 
-members_changed(#gm_members_changed {
-                   args = [CPid], births = Births, deaths = Deaths }) ->
+members_changed([CPid], Births, Deaths) ->
     ok.
 
-handle_msg(#gm_handle_msg { args = [CPid], from = From, msg = Msg }) ->
-    ok.
-
-terminate(#gm_terminate { args = [CPid], reason = Reason }) ->
+handle_msg([CPid], From, Msg) ->
     ok.
 
 %% ---------------------------------------------------------------------------

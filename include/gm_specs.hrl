@@ -14,13 +14,13 @@
 %% Copyright (c) 2007-2010 VMware, Inc.  All rights reserved.
 %%
 
--include("gm.hrl").
-
 -ifdef(use_specs).
 
 -export_type([joined/0, members_changed/0, handle_msg/0, terminate/0]).
 
 -type(callback_result() :: 'ok' | {'stop', any()}).
+-type(args() :: [any()]).
+-type(members() :: [pid()]).
 
 -type(joined()          :: #gm_joined          { args    :: [any()],
                                                  members :: [pid()] }).
@@ -33,9 +33,9 @@
 -type(terminate()       :: #gm_terminate       { args    :: [any()],
                                                  reason  :: term() }).
 
--spec(joined/1          :: (joined())          -> callback_result()).
--spec(members_changed/1 :: (members_changed()) -> callback_result()).
--spec(handle_msg/1      :: (handle_msg()])     -> callback_result()).
--spec(terminate/1       :: (terminate())       -> any()).
+-spec(joined/2          :: (args(), members())            -> callback_result()).
+-spec(members_changed/3 :: (args(), members(), members()) -> callback_result()).
+-spec(handle_msg/3      :: (args(), pid(), any())         -> callback_result()).
+-spec(terminate/2       :: (args(), term())               -> any()).
 
 -endif.

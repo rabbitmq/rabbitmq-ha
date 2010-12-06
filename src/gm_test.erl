@@ -17,7 +17,7 @@
 -module(gm_test).
 
 -export([test/0]).
--export([joined/1, members_changed/1, handle_msg/1, terminate/1]).
+-export([joined/2, members_changed/3, handle_msg/3, terminate/2]).
 
 -behaviour(gm).
 
@@ -40,14 +40,14 @@ inc() ->
         N      -> put(count, N)
     end.
 
-joined(#gm_joined { members = Members }) ->
+joined([], Members) ->
     io:format("Joined ~p (~p members)~n", [self(), length(Members)]),
     put(state, dict:from_list([{Member, empty} || Member <- Members])),
     put(count, 0),
     put(ts, os:timestamp()),
     ok.
 
-members_changed(#gm_members_changed { births = Births, deaths = Deaths }) ->
+members_changed([], Births, Deaths) ->
     with_state(
       fun (State) ->
               State1 =
@@ -64,7 +64,7 @@ members_changed(#gm_members_changed { births = Births, deaths = Deaths }) ->
       end),
     ok.
 
-handle_msg(#gm_handle_msg { from = From, msg = {test_msg, Num} }) ->
+handle_msg([], From, {test_msg, Num}) ->
     inc(),
     with_state(
       fun (State) ->
@@ -84,7 +84,7 @@ handle_msg(#gm_handle_msg { from = From, msg = {test_msg, Num} }) ->
       end),
     ok.
 
-terminate(#gm_terminate { reason = Reason }) ->
+terminate([], Reason) ->
     io:format("Left ~p (~p)~n", [self(), Reason]),
     ok.
 
