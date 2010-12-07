@@ -22,17 +22,6 @@
 -type(args() :: [any()]).
 -type(members() :: [pid()]).
 
--type(joined()          :: #gm_joined          { args    :: [any()],
-                                                 members :: [pid()] }).
--type(members_changed() :: #gm_members_changed { args    :: [any()],
-                                                 births  :: [pid()],
-                                                 deaths  :: [pid()] }).
--type(handle_msg()      :: #gm_handle_msg      { args    :: [any()],
-                                                 from    :: pid(),
-                                                 msg     :: any() }).
--type(terminate()       :: #gm_terminate       { args    :: [any()],
-                                                 reason  :: term() }).
-
 -spec(joined/2          :: (args(), members())            -> callback_result()).
 -spec(members_changed/3 :: (args(), members(), members()) -> callback_result()).
 -spec(handle_msg/3      :: (args(), pid(), any())         -> callback_result()).
