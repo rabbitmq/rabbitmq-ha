@@ -81,6 +81,7 @@ handle_cast({deliver, Txn, Message, ChPid}, State) ->
     fix_me;
 
 handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
+                                                  gm          = GM,
                                                   master_node = MNode }) ->
     io:format("Slave (~p) got deaths: ~p~n", [self(), Deaths]),
     noreply(
@@ -91,6 +92,7 @@ handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
           {Node, Node} ->
               promote_me(State);
           {_Node, MNode1} ->
+              ok = gm:broadcast(GM, heartbeat),
               State #state { master_node = MNode1 }
       end).
 
@@ -136,4 +138,5 @@ reply(Reply, State) ->
 
 promote_me(#state { gm = GM }) ->
     ok = gm:broadcast(GM, heartbeat),
+    io:format("Promoting ~p~p!", [self()]),
     todo.
