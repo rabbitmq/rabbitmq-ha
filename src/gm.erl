@@ -381,6 +381,8 @@
 
 -export([behaviour_info/1]).
 
+-export([add_to_rabbit_mnesia/0]).
+
 -define(GROUP_TABLE, gm_group).
 -define(HIBERNATE_AFTER_MIN, 1000).
 -define(DESIRED_HIBERNATE, 10000).
@@ -405,12 +407,16 @@
 
 -record(member, { pending_ack, last_pub, last_ack }).
 
--define(TAG, '$gm').
+-define(TABLE, {?GROUP_TABLE, [{record_name, gm_group},
+                               {attributes, record_info(fields, gm_group)}]}).
+-define(TABLE_MATCH, {match, #gm_group { _ = '_' }}).
 
--define(TABLES,
-        [{?GROUP_TABLE, [{record_name, gm_group},
-                         {attributes, record_info(fields, gm_group)}]}
-        ]).
+-rabbit_boot_step({gm_tables,
+                   [{description, "add GM tables to rabbit_mnesia"},
+                    {mfa,         {?MODULE, add_to_rabbit_mnesia, []}},
+                    {enables,     database}]}).
+
+-define(TAG, '$gm').
 
 -ifdef(use_specs).
 
@@ -463,7 +469,7 @@ behaviour_info(_Other) ->
     undefined.
 
 create_tables() ->
-    create_tables(?TABLES).
+    create_tables([?TABLE]).
 
 create_tables([]) ->
     ok;
@@ -473,6 +479,11 @@ create_tables([{Table, Attributes} | Tables]) ->
         {aborted, {already_exists, gm_group}} -> create_tables(Tables);
         Err                                   -> Err
     end.
+
+add_to_rabbit_mnesia() ->
+    {Name, Attributes} = ?TABLE,
+    ok = rabbit_mnesia:add_table_definition(
+           {Name, [?TABLE_MATCH | Attributes]}).
 
 start_link(GroupName, Module, Args) ->
     gen_server2:start_link(?MODULE, [GroupName, Module, Args], []).
