@@ -554,10 +554,7 @@ handle_call({add_on_right, NewMember}, _From,
 
 
 handle_cast({?TAG, ReqVer, Msg},
-            State = #state { self          = Self,
-                             left          = {Left, _MRefL},
-                             right         = {Right, _MRefR},
-                             view          = View,
+            State = #state { view          = View,
                              group_name    = GroupName,
                              module        = Module,
                              callback_args = Args }) ->
@@ -565,14 +562,8 @@ handle_cast({?TAG, ReqVer, Msg},
         case needs_view_update(ReqVer, View) of
             true ->
                 View1 = group_to_view(read_group(GroupName)),
-                Result1 = callback_view_changed(Args, Module, View, View1),
-                State2 = State #state { view = View1 },
-                {Result1, case fetch_view_member(Self, View1) of
-                              #view_member { left = Left, right = Right } ->
-                                  State2;
-                              _ ->
-                                  check_neighbours(State2)
-                          end};
+                {callback_view_changed(Args, Module, View, View1),
+                 check_neighbours(State #state { view = View1 })};
             false ->
                 {ok, State}
         end,
@@ -596,10 +587,17 @@ handle_cast({broadcast, Msg}, State) ->
 
 handle_cast(join, State = #state { self          = Self,
                                    group_name    = GroupName,
+                                   members_state = undefined,
                                    module        = Module,
                                    callback_args = Args }) ->
     View = join_group(Self, GroupName),
-    State1 = check_neighbours(State #state { view = View }),
+    MembersState =
+        case alive_view_members(View) of
+            [Self] -> blank_member_state();
+            _      -> undefined
+        end,
+    State1 = check_neighbours(State #state { view          = View,
+                                             members_state = MembersState }),
     handle_callback_result(
       {Module:joined(Args, all_known_members(View)), State1});
 
@@ -608,12 +606,11 @@ handle_cast(leave, State) ->
 
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason},
-            State = #state { left          = Left,
+            State = #state { self          = Self,
+                             left          = Left,
                              right         = Right,
                              group_name    = GroupName,
-                             view          = View,
-                             module        = Module,
-                             callback_args = Args }) ->
+                             confirms      = Confirms }) ->
     Member = case {Left, Right} of
                  {{Member1, MRef}, _} -> Member1;
                  {_, {Member1, MRef}} -> Member1;
@@ -625,9 +622,18 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason},
         _ ->
             View1 =
                 group_to_view(record_dead_member_in_group(Member, GroupName)),
-            State1 = check_neighbours(State #state { view = View1 }),
-            handle_callback_result(
-              {callback_view_changed(Args, Module, View, View1), State1})
+            State1 = State #state { view = View1 },
+            {Result, State2} =
+                case alive_view_members(View1) of
+                    [Self] ->
+                        maybe_erase_aliases(
+                          State1 #state {
+                            members_state = blank_member_state(),
+                            confirms      = purge_confirms(Confirms) });
+                    _ ->
+                        {ok, State1}
+                end,
+            handle_callback_result({Result, check_neighbours(State2)})
     end.
 
 
@@ -739,8 +745,12 @@ handle_msg({activity, Left, Activity},
     State1 = State #state { members_state = MembersState1,
                             confirms      = Confirms1 },
     Activity3 = activity_finalise(Activity1),
-    ok = maybe_send_activity(Activity3, State1),
-    {callback(Args, Module, Activity3), maybe_erase_aliases(State1)};
+    {Result, State2} = maybe_erase_aliases(State1),
+    ok = maybe_send_activity(Activity3, State2),
+    case Result of
+        ok -> {callback(Args, Module, Activity3), State2};
+        _  -> {Result, State2}
+    end;
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
     {ok, State}.
@@ -1006,7 +1016,9 @@ erase_members_in_group(Members, GroupName) ->
 maybe_erase_aliases(State = #state { self          = Self,
                                      group_name    = GroupName,
                                      view          = View,
-                                     members_state = MembersState }) ->
+                                     members_state = MembersState,
+                                     module        = Module,
+                                     callback_args = Args }) ->
     #view_member { aliases = Aliases } = fetch_view_member(Self, View),
     {Erasable, MembersState1}
         = ?SETS:fold(
@@ -1019,11 +1031,14 @@ maybe_erase_aliases(State = #state { self          = Self,
                         false -> Acc
                     end
             end, {[], MembersState}, Aliases),
+    State1 = State #state { members_state = MembersState1 },
     case Erasable of
-        [] -> ok;
-        _  -> erase_members_in_group(Erasable, GroupName)
-    end,
-    State #state { members_state = MembersState1 }.
+        [] -> {ok, State1};
+        _  -> View1 = group_to_view(
+                        erase_members_in_group(Erasable, GroupName)),
+              {callback_view_changed(Args, Module, View, View1),
+               State1 #state { view = View1 }}
+    end.
 
 can_erase_view_member(Self, Self, _LA, _LP) -> false;
 can_erase_view_member(_Self, _Id,   N,   N) -> true;
@@ -1056,28 +1071,16 @@ maybe_monitor(Self, Self) ->
 maybe_monitor(Other, _Self) ->
     erlang:monitor(process, Other).
 
-check_neighbours(State = #state { self          = Self,
-                                  left          = Left,
-                                  right         = Right,
-                                  view          = View,
-                                  members_state = MembersState,
-                                  confirms      = Confirms }) ->
+check_neighbours(State = #state { self  = Self,
+                                  left  = Left,
+                                  right = Right,
+                                  view  = View }) ->
     #view_member { left = VLeft, right = VRight }
         = fetch_view_member(Self, View),
     Ver = view_version(View),
     Left1 = ensure_neighbour(Ver, Self, Left, VLeft),
     Right1 = ensure_neighbour(Ver, Self, Right, VRight),
-    {MembersState1, Confirms1} =
-        case {Left1, Right1} of
-            {{Self, undefined}, {Self, undefined}} ->
-                {blank_member_state(), purge_confirms(Confirms)};
-            _ ->
-                {MembersState, Confirms}
-        end,
-    State1 = State #state { left          = Left1,
-                            right         = Right1,
-                            members_state = MembersState1,
-                            confirms      = Confirms1 },
+    State1 = State #state { left = Left1, right = Right1 },
     ok = maybe_send_catchup(Right, State1),
     State1.
 
