@@ -140,26 +140,30 @@ requeue(AckTags, MsgPropsFun, #state {} = State) ->
     %% gm:broadcast(GM, {requeue, Guids}),
     State.
 
-len(#state {}) ->
-    0.
+len(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:len(BQS).
 
-is_empty(State) ->
-    0 =:= len(State).
+is_empty(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:is_empty(BQS).
 
-set_ram_duration_target(Target, #state {} = State) ->
-    State.
+set_ram_duration_target(Target, State = #state { backing_queue       = BQ,
+                                                 backing_queue_state = BQS}) ->
+    State #state { backing_queue_state =
+                       BQ:set_ram_duration_target(Target, BQS) }.
 
-ram_duration(#state {} = State) ->
-    {0, State}.
+ram_duration(State = #state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    {Result, BQS1} = BQ:ram_duration(BQS),
+    {Result, State #state { backing_queue_state = BQS1 }}.
 
-needs_idle_timeout(#state {} = State) ->
-    false.
+needs_idle_timeout(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:needs_idle_timeout(BQS).
 
-idle_timeout(#state {} = State) ->
-    State.
+idle_timeout(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:idle_timeout(BQS).
 
-handle_pre_hibernate(#state {} = State) ->
-    State.
+handle_pre_hibernate(State = #state { backing_queue       = BQ,
+                                      backing_queue_state = BQS}) ->
+    State #state { backing_queue_state = BQ:handle_pre_hibernate(BQS) }.
 
-status(#state {}) ->
-    [].
+status(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:status(BQS).
