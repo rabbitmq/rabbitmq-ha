@@ -578,10 +578,12 @@ handle_cast({?TAG, ReqVer, Msg},
             false ->
                 {ok, State}
         end,
-    case Result of
-        ok -> handle_callback_result(handle_msg(Msg, State1));
-        _  -> handle_callback_result({Result, State1})
-    end;
+    handle_callback_result(
+      if_callback_success(
+        Result,
+        fun (_Result1, State2) -> handle_msg(Msg, State2) end,
+        fun (Result1,  State2) -> {Result1, State2} end,
+        State1));
 
 handle_cast({broadcast, _Msg}, State = #state { members_state = undefined }) ->
     noreply(State);
@@ -758,10 +760,11 @@ handle_msg({activity, Left, Activity},
     Activity3 = activity_finalise(Activity1),
     {Result, State2} = maybe_erase_aliases(State1),
     ok = maybe_send_activity(Activity3, State2),
-    case Result of
-        ok -> {callback(Args, Module, Activity3), State2};
-        _  -> {Result, State2}
-    end;
+    if_callback_success(
+      Result,
+      fun (_Result1, State3) -> {callback(Args, Module, Activity3), State3} end,
+      fun (Result1,  State3) -> {Result1, State3} end,
+      State2);
 
 handle_msg({activity, _NotLeft, _Activity}, State) ->
     {ok, State}.
@@ -1229,14 +1232,26 @@ callback_view_changed(Args, Module, OldView, NewView) ->
         _        -> Module:members_changed(Args, Births, Deaths)
     end.
 
-handle_callback_result({ok, State}) ->
-    noreply(State);
-handle_callback_result({{stop, Reason}, State}) ->
-    {stop, Reason, State};
-handle_callback_result({ok, Reply, State}) ->
-    reply(Reply, State);
-handle_callback_result({{stop, Reason}, Reply, State}) ->
-    {stop, Reason, Reply, State}.
+handle_callback_result({Result, State}) ->
+    if_callback_success(
+      Result,
+      fun (_Result, State1) -> noreply(State1) end,
+      fun ({stop, Reason}, State1) -> {stop, Reason, State1} end,
+      State);
+handle_callback_result({Result, Reply, State}) ->
+    if_callback_success(
+      Result,
+      fun (_Result, State1) -> reply(Reply, State1) end,
+      fun ({stop, Reason}, State1) -> {stop, Reason, Reply, State1} end,
+      State).
+
+if_callback_success(ok, True, _False, State) ->
+    True(ok, State);
+if_callback_success({become, Module, Args} = Result, True, _False, State) ->
+    True(Result, State #state { module        = Module,
+                                callback_args = Args });
+if_callback_success({stop, _Reason} = Result, _True, False, State) ->
+    False(Result, State).
 
 maybe_confirm(_Self, _Id, Confirms, []) ->
     Confirms;
