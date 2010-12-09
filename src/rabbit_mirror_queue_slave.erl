@@ -179,7 +179,8 @@ handle_msg([SPid], From, Msg) ->
 promote_me(From, #state { q                   = Q,
                           gm                  = GM,
                           backing_queue       = BQ,
-                          backing_queue_state = BQS }) ->
+                          backing_queue_state = BQS,
+                          rate_timer_ref      = RateTRef }) ->
     io:format("Promoting ~p!~n", [self()]),
     {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, GM),
     true = unlink(GM),
@@ -188,7 +189,7 @@ promote_me(From, #state { q                   = Q,
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
                     CPid, BQ, BQS),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
-                   Q, rabbit_mirror_queue_master, MasterState),
+                   Q, rabbit_mirror_queue_master, MasterState, RateTRef),
     {become, rabbit_amqqueue_process, QueueState, hibernate}.
 
 noreply(State) ->
