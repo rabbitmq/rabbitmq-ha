@@ -46,6 +46,7 @@ set_maximum_since_use(QPid, Age) ->
     gen_server2:cast(QPid, {set_maximum_since_use, Age}).
 
 init([#amqqueue { name = QueueName } = Q]) ->
+    process_flag(trap_exit, true), %% amqqueue_process traps exits too.
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
     receive {joined, GM, Nodes} ->
@@ -133,6 +134,8 @@ handle_info(Msg, State) ->
 
 terminate(_Reason, State = #state {}) ->
     %% gen_server case
+    %% TODO: figure out what to do with the backing queue. See
+    %% amqqueue_process:terminate/2
     ok;
 terminate([SPid], Reason) ->
     %% gm case

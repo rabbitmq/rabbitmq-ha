@@ -67,12 +67,17 @@ promote_backing_queue_state(CPid, BQ, BQS) ->
              backing_queue       = BQ,
              backing_queue_state = BQS }.
 
-terminate(#state {}) ->
-    %% backing queue termination
-    ok.
+terminate(State = #state { backing_queue = BQ, backing_queue_state = BQS }) ->
+    %% Backing queue termination. The queue is going down but
+    %% shouldn't be deleted. It thinks it's durable most likely. Not
+    %% sure yet what to tell the slaves.
+    State #state { backing_queue_state = BQ:terminate(BQS) }.
 
-delete_and_terminate(#state {} = State) ->
-    State.
+delete_and_terminate(State = #state { backing_queue       = BQ,
+                                      backing_queue_state = BQS }) ->
+    %% TODO: should confirmed_broadcast to make sure our slaves don't
+    %% try and promote themselves.
+    State #state { backing_queue_state = BQ:delete_and_terminate(BQS) }.
 
 purge(#state {} = State) ->
     %% get count and gm:broadcast(GM, {drop_next, Count})
