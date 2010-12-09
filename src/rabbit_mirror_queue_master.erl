@@ -26,11 +26,16 @@
 
 -export([start/1, stop/0]).
 
+-export([promote_backing_queue_state/3]).
+
 -behaviour(rabbit_backing_queue).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--record(state, { coordinator, vq }).
+-record(state, { coordinator,
+                 backing_queue,
+                 backing_queue_state
+               }).
 
 %% ---------------------------------------------------------------------------
 %% Backing queue
@@ -45,13 +50,22 @@ stop() ->
     %% Same as start/1.
     exit({not_valid_for_generic_backing_queue, ?MODULE}).
 
-init(#amqqueue { name = QueueName, arguments = Args, durable = false },
-     Recover) ->
-    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(QueueName),
+init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
+    {ok, CPid} =
+        rabbit_mirror_queue_coordinator:start_link(Q, undefined),
     {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
     [rabbit_mirror_queue_coordinator:add_slave(CPid, binary_to_atom(Node, utf8))
      || {longstr, Node} <- Nodes],
-    #state { coordinator = CPid }.
+    {ok, BQ} = application:get_env(backing_queue_module),
+    BQS = BQ:init(Q, Recover),
+    #state { coordinator         = CPid,
+             backing_queue       = BQ,
+             backing_queue_state = BQS }.
+
+promote_backing_queue_state(CPid, BQ, BQS) ->
+    #state { coordinator         = CPid,
+             backing_queue       = BQ,
+             backing_queue_state = BQS }.
 
 terminate(#state {}) ->
     %% backing queue termination

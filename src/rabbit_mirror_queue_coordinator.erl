@@ -16,7 +16,7 @@
 
 -module(rabbit_mirror_queue_coordinator).
 
--export([start_link/1, add_slave/2]).
+-export([start_link/2, add_slave/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -29,14 +29,14 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("gm_specs.hrl").
 
--record(state, { name,
+-record(state, { q,
                  gm
                }).
 
 -define(ONE_SECOND, 1000).
 
-start_link(QueueName) ->
-    gen_server2:start_link(?MODULE, [QueueName], []).
+start_link(Queue, GM) ->
+    gen_server2:start_link(?MODULE, [Queue, GM], []).
 
 add_slave(CPid, SlaveNode) ->
     gen_server2:cast(CPid, {add_slave, SlaveNode}).
@@ -45,27 +45,35 @@ add_slave(CPid, SlaveNode) ->
 %% gen_server
 %% ---------------------------------------------------------------------------
 
-init([QueueName]) ->
-    ok = gm:create_tables(),
-    {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
-    receive {joined, GM, _Members} ->
-            ok
-    end,
+init([#amqqueue { name = QueueName } = Q, GM]) ->
+    GM1 = case GM of
+              undefined ->
+                  ok = gm:create_tables(),
+                  {ok, GM2} = gm:start_link(QueueName, ?MODULE, [self()]),
+                  receive {joined, GM2, _Members} ->
+                          ok
+                  end,
+                  GM2;
+              _ ->
+                  true = link(GM),
+                  GM
+          end,
     {ok, _TRef} =
-        timer:apply_interval(?ONE_SECOND, gm, broadcast, [GM, heartbeat]),
-    {ok, #state { name = QueueName, gm = GM }, hibernate,
+        timer:apply_interval(?ONE_SECOND, gm, broadcast, [GM1, heartbeat]),
+    {ok, #state { q = Q, gm = GM1 }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
 handle_call(Msg, _From, State) ->
     {stop, {unexpected_call, Msg}, State}.
 
-handle_cast({add_slave, Node}, State = #state { name = QueueName }) ->
-    Result = rabbit_mirror_queue_slave_sup:start_child(Node, [QueueName]),
+handle_cast({add_slave, Node}, State = #state { q = Q }) ->
+    Result = rabbit_mirror_queue_slave_sup:start_child(Node, [Q]),
     io:format("Add Slave '~p' => ~p~n", [Node, Result]),
     noreply(State);
 
-handle_cast({gm_deaths, Deaths}, State = #state { gm   = GM,
-                                                  name = QueueName }) ->
+handle_cast({gm_deaths, Deaths},
+            State = #state { gm = GM,
+                             q  = #amqqueue { name = QueueName } }) ->
     io:format("Coord (~p) got deaths: ~p~n", [self(), Deaths]),
     Node = node(),
     Node = node(rabbit_mirror_queue_misc:remove_from_queue(QueueName, Deaths)),
@@ -97,6 +105,7 @@ members_changed([CPid], Births, Deaths) ->
     ok = gen_server2:cast(CPid, {gm_deaths, Deaths}).
 
 handle_msg([_CPid], _From, heartbeat) ->
+    io:format("C ~p~n", [_CPid]),
     ok;
 handle_msg([CPid], From, Msg) ->
     ok.

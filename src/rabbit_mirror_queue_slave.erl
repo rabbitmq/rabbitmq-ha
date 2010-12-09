@@ -29,15 +29,17 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("gm_specs.hrl").
 
--record(state, { name,
+-record(state, { q,
                  gm,
-                 master_node
+                 master_node,
+                 backing_queue,
+                 backing_queue_state
                }).
 
-start_link(QueueName) ->
-    gen_server2:start_link(?MODULE, [QueueName], []).
+start_link(Q) ->
+    gen_server2:start_link(?MODULE, [Q], []).
 
-init([QueueName]) ->
+init([#amqqueue { name = QueueName } = Q]) ->
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
     receive {joined, GM, Nodes} ->
@@ -47,20 +49,22 @@ init([QueueName]) ->
     Node = node(),
     case rabbit_misc:execute_mnesia_transaction(
            fun () ->
-                   [Q = #amqqueue { pid = QPid, extra_pids = EPids }] =
+                   [Q1 = #amqqueue { pid = QPid, extra_pids = EPids }] =
                        mnesia:read({rabbit_queue, QueueName}),
                    case [Pid || Pid <- [QPid | EPids], node(Pid) =:= Node] of
                        [] ->
                            EPids1 = EPids ++ [Self],
                            mnesia:write(rabbit_queue,
-                                        Q #amqqueue { extra_pids = EPids1 },
+                                        Q1 #amqqueue { extra_pids = EPids1 },
                                         write),
                            {ok, QPid};
                        _ ->
                            {error, node_already_present}
                    end
            end) of
-        {ok, MPid}     -> {ok, #state { name        = QueueName,
+        {ok, MPid}     -> {ok, BQ} = application:get_env(backing_queue_module),
+                          BQS = BQ:init(Q, false),
+                          {ok, #state { q           = Q,
                                         gm          = GM,
                                         master_node = node(MPid) }, hibernate,
                            {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
@@ -74,26 +78,29 @@ handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
 
 handle_call({deliver, Txn, Message, ChPid}, _From, State) ->
     %% Synchronous, "mandatory" delivery mode
-    fix_me.
-
-handle_cast({deliver, Txn, Message, ChPid}, State) ->
-    %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
     fix_me;
 
-handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
-                                                  gm          = GM,
-                                                  master_node = MNode }) ->
+handle_call({gm_deaths, Deaths}, From,
+            State = #state { q           = #amqqueue { name = QueueName },
+                             gm          = GM,
+                             master_node = MNode }) ->
     io:format("Slave (~p) got deaths: ~p~n", [self(), Deaths]),
     case {node(), node(rabbit_mirror_queue_misc:remove_from_queue(
                          QueueName, Deaths))} of
         {_Node, MNode} ->
-            noreply(State);
+            reply(ok, State);
         {Node, Node} ->
-            promote_me(State);
+            promote_me(From, State);
         {_Node, MNode1} ->
+            gen_server2:reply(From, ok),
             ok = gm:broadcast(GM, heartbeat),
             noreply(State #state { master_node = MNode1 })
     end.
+
+
+handle_cast({deliver, Txn, Message, ChPid}, State) ->
+    %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
+    fix_me.
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
@@ -118,9 +125,13 @@ joined([SPid], Members) ->
 
 members_changed([SPid], Births, Deaths) ->
     io:format("S: ~p ~p ~p~n", [SPid, Births, Deaths]),
-    ok = gen_server2:cast(SPid, {gm_deaths, Deaths}).
+    case gen_server2:call(SPid, {gm_deaths, Deaths}) of
+        ok              -> ok;
+        {promote, CPid} -> {become, rabbit_mirror_queue_coordinator, [CPid]}
+    end.
 
 handle_msg([_SPid], _From, heartbeat) ->
+    io:format("S: ~p~n", [_SPid]),
     ok;
 handle_msg([SPid], From, Msg) ->
     ok.
@@ -135,7 +146,15 @@ noreply(State) ->
 reply(Reply, State) ->
     {reply, Reply, State, hibernate}.
 
-promote_me(#state { gm = GM }) ->
-    ok = gm:broadcast(GM, heartbeat),
+promote_me(From, #state { q                   = Q,
+                          gm                  = GM,
+                          backing_queue       = BQ,
+                          backing_queue_state = BQS }) ->
     io:format("Promoting ~p!~n", [self()]),
+    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, GM),
+    true = unlink(GM),
+    gen_server2:reply(From, {promote, CPid}),
+    ok = gm:broadcast(GM, heartbeat),
+    MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
+                    CPid, BQ, BQS),
     {become, rabbit_amqqueue_process, this_is_not_a_valid_state}.
