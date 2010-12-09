@@ -157,4 +157,6 @@ promote_me(From, #state { q                   = Q,
     ok = gm:broadcast(GM, heartbeat),
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
                     CPid, BQ, BQS),
-    {become, rabbit_amqqueue_process, this_is_not_a_valid_state}.
+    QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
+                   Q, rabbit_mirror_queue_master, MasterState),
+    {become, rabbit_amqqueue_process, QueueState, hibernate}.
