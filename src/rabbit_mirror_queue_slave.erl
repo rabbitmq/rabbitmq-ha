@@ -73,9 +73,11 @@ init([#amqqueue { name = QueueName } = Q]) ->
                             [self()]}),
             {ok, BQ} = application:get_env(backing_queue_module),
             BQS = BQ:init(Q, false),
-            {ok, #state { q           = Q,
-                          gm          = GM,
-                          master_node = node(MPid) }, hibernate,
+            {ok, #state { q                   = Q,
+                          gm                  = GM,
+                          master_node         = node(MPid),
+                          backing_queue       = BQ,
+                          backing_queue_state = BQS }, hibernate,
              {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
               ?DESIRED_HIBERNATE}};
         {error, Error} ->
