@@ -84,17 +84,16 @@ handle_cast({gm_deaths, Deaths}, State = #state { name        = QueueName,
                                                   gm          = GM,
                                                   master_node = MNode }) ->
     io:format("Slave (~p) got deaths: ~p~n", [self(), Deaths]),
-    noreply(
-      case {node(), node(rabbit_mirror_queue_misc:remove_from_queue(
-                           QueueName, Deaths))} of
-          {_Node, MNode} ->
-              State;
-          {Node, Node} ->
-              promote_me(State);
-          {_Node, MNode1} ->
-              ok = gm:broadcast(GM, heartbeat),
-              State #state { master_node = MNode1 }
-      end).
+    case {node(), node(rabbit_mirror_queue_misc:remove_from_queue(
+                         QueueName, Deaths))} of
+        {_Node, MNode} ->
+            noreply(State);
+        {Node, Node} ->
+            promote_me(State);
+        {_Node, MNode1} ->
+            ok = gm:broadcast(GM, heartbeat),
+            noreply(State #state { master_node = MNode1 })
+    end.
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
@@ -138,5 +137,5 @@ reply(Reply, State) ->
 
 promote_me(#state { gm = GM }) ->
     ok = gm:broadcast(GM, heartbeat),
-    io:format("Promoting ~p~p!", [self()]),
-    todo.
+    io:format("Promoting ~p!~n", [self()]),
+    {become, rabbit_amqqueue_process, this_is_not_a_valid_state}.
