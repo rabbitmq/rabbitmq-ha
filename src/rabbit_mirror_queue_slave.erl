@@ -19,7 +19,7 @@
 -export([start_link/1, set_maximum_since_use/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
-         code_change/3]).
+         code_change/3, handle_pre_hibernate/1]).
 
 -export([joined/2, members_changed/3, handle_msg/3]).
 
@@ -33,8 +33,11 @@
                  gm,
                  master_node,
                  backing_queue,
-                 backing_queue_state
+                 backing_queue_state,
+                 rate_timer_ref
                }).
+
+-define(RAM_DURATION_UPDATE_INTERVAL,  5000).
 
 start_link(Q) ->
     gen_server2:start_link(?MODULE, [Q], []).
@@ -77,7 +80,8 @@ init([#amqqueue { name = QueueName } = Q]) ->
                           gm                  = GM,
                           master_node         = node(MPid),
                           backing_queue       = BQ,
-                          backing_queue_state = BQS }, hibernate,
+                          backing_queue_state = BQS,
+                          rate_timer_ref      = undefined }, hibernate,
              {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
               ?DESIRED_HIBERNATE}};
         {error, Error} ->
@@ -137,6 +141,16 @@ terminate([SPid], Reason) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+handle_pre_hibernate(State = #state { backing_queue       = BQ,
+                                      backing_queue_state = BQS }) ->
+    %% mainly copied from amqqueue_process
+    BQS1 = BQ:handle_pre_hibernate(BQS),
+    %% no activity for a while == 0 egress and ingress rates
+    DesiredDuration =
+        rabbit_memory_monitor:report_ram_duration(self(), infinity),
+    BQS2 = BQ:set_ram_duration_target(DesiredDuration, BQS1),
+    {hibernate, stop_rate_timer(State #state { backing_queue_state = BQS2 })}.
+
 %% ---------------------------------------------------------------------------
 %% GM
 %% ---------------------------------------------------------------------------
@@ -162,12 +176,6 @@ handle_msg([SPid], From, Msg) ->
 %% Others
 %% ---------------------------------------------------------------------------
 
-noreply(State) ->
-    {noreply, State, hibernate}.
-
-reply(Reply, State) ->
-    {reply, Reply, State, hibernate}.
-
 promote_me(From, #state { q                   = Q,
                           gm                  = GM,
                           backing_queue       = BQ,
@@ -182,3 +190,32 @@ promote_me(From, #state { q                   = Q,
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
                    Q, rabbit_mirror_queue_master, MasterState),
     {become, rabbit_amqqueue_process, QueueState, hibernate}.
+
+noreply(State) ->
+    {noreply, next_state(State), hibernate}.
+
+reply(Reply, State) ->
+    {reply, Reply, next_state(State), hibernate}.
+
+next_state(State) ->
+    ensure_rate_timer(State).
+
+%% copied+pasted from amqqueue_process
+ensure_rate_timer(State = #state { rate_timer_ref = undefined }) ->
+    {ok, TRef} = timer:apply_after(
+                   ?RAM_DURATION_UPDATE_INTERVAL,
+                   rabbit_amqqueue, update_ram_duration,
+                   [self()]),
+    State #state { rate_timer_ref = TRef };
+ensure_rate_timer(State = #state { rate_timer_ref = just_measured }) ->
+    State #state { rate_timer_ref = undefined };
+ensure_rate_timer(State) ->
+    State.
+
+stop_rate_timer(State = #state { rate_timer_ref = undefined }) ->
+    State;
+stop_rate_timer(State = #state { rate_timer_ref = just_measured }) ->
+    State #state { rate_timer_ref = undefined };
+stop_rate_timer(State = #state { rate_timer_ref = TRef }) ->
+    {ok, cancel} = timer:cancel(TRef),
+    State #state { rate_timer_ref = undefined }.
