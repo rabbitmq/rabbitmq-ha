@@ -16,7 +16,7 @@
 
 -module(rabbit_mirror_queue_slave).
 
--export([start_link/1]).
+-export([start_link/1, set_maximum_since_use/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -38,6 +38,9 @@
 
 start_link(Q) ->
     gen_server2:start_link(?MODULE, [Q], []).
+
+set_maximum_since_use(QPid, Age) ->
+    gen_server2:cast(QPid, {set_maximum_since_use, Age}).
 
 init([#amqqueue { name = QueueName } = Q]) ->
     ok = gm:create_tables(),
@@ -62,14 +65,21 @@ init([#amqqueue { name = QueueName } = Q]) ->
                            {error, node_already_present}
                    end
            end) of
-        {ok, MPid}     -> {ok, BQ} = application:get_env(backing_queue_module),
-                          BQS = BQ:init(Q, false),
-                          {ok, #state { q           = Q,
-                                        gm          = GM,
-                                        master_node = node(MPid) }, hibernate,
-                           {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
-                            ?DESIRED_HIBERNATE}};
-        {error, Error} -> {stop, Error}
+        {ok, MPid} ->
+            ok = file_handle_cache:register_callback(
+                   rabbit_amqqueue, set_maximum_since_use, [self()]),
+            ok = rabbit_memory_monitor:register(
+                   self(), {rabbit_amqqueue, set_ram_duration_target,
+                            [self()]}),
+            {ok, BQ} = application:get_env(backing_queue_module),
+            BQS = BQ:init(Q, false),
+            {ok, #state { q           = Q,
+                          gm          = GM,
+                          master_node = node(MPid) }, hibernate,
+             {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
+              ?DESIRED_HIBERNATE}};
+        {error, Error} ->
+            {stop, Error}
     end.
 
 handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
@@ -100,7 +110,17 @@ handle_call({gm_deaths, Deaths}, From,
 
 handle_cast({deliver, Txn, Message, ChPid}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
-    fix_me.
+    fix_me;
+
+handle_cast({set_maximum_since_use, Age}, State) ->
+    ok = file_handle_cache:set_maximum_since_use(Age),
+    noreply(State);
+
+handle_cast({set_ram_duration_target, Duration},
+            State = #state { backing_queue       = BQ,
+                             backing_queue_state = BQS }) ->
+    BQS1 = BQ:set_ram_duration_target(Duration, BQS),
+    noreply(State #state { backing_queue_state = BQS1 }).
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
