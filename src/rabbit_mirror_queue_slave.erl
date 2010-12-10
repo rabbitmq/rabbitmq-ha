@@ -84,7 +84,6 @@
                  backing_queue_state,
                  rate_timer_ref,
 
-                 queue_head,    %% :: undefined | Guid | locked <= coping with fetch
                  sender_queues, %% :: Pid -> MsgQ
                  guid_ack,      %% :: Guid -> AckTag
                  instructions   %% :: InstrQ
@@ -135,20 +134,27 @@ init([#amqqueue { name = QueueName } = Q]) ->
                           master_node         = node(MPid),
                           backing_queue       = BQ,
                           backing_queue_state = BQS,
-                          rate_timer_ref      = undefined }, hibernate,
+                          rate_timer_ref      = undefined,
+
+                          sender_queues       = dict:new(),
+                          guid_ack            = dict:new(),
+                          instructions        = queue:new()
+                        }, hibernate,
              {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
               ?DESIRED_HIBERNATE}};
         {error, Error} ->
             {stop, Error}
     end.
 
-handle_call({deliver_immediately, Txn, Message, ChPid}, _From, State) ->
+handle_call({deliver_immediately, Txn, Message, ChPid}, From, State) ->
     %% Synchronous, "immediate" delivery mode
-    fix_me;
+    gen_server2:reply(From, false), %% master may deliver it, not us
+    noreply(enqueue_message(Txn, Message, ChPid, State));
 
-handle_call({deliver, Txn, Message, ChPid}, _From, State) ->
+handle_call({deliver, Txn, Message, ChPid}, From, State) ->
     %% Synchronous, "mandatory" delivery mode
-    fix_me;
+    gen_server2:reply(From, true), %% amqqueue throws away the result anyway
+    noreply(enqueue_message(Txn, Message, ChPid, State));
 
 handle_call({gm_deaths, Deaths}, From,
             State = #state { q           = #amqqueue { name = QueueName },
@@ -170,7 +176,7 @@ handle_call({gm_deaths, Deaths}, From,
 
 handle_cast({deliver, Txn, Message, ChPid}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
-    fix_me;
+    noreply(enqueue_message(Txn, Message, ChPid, State));
 
 handle_cast({set_maximum_since_use, Age}, State) ->
     ok = file_handle_cache:set_maximum_since_use(Age),
@@ -278,3 +284,113 @@ stop_rate_timer(State = #state { rate_timer_ref = just_measured }) ->
 stop_rate_timer(State = #state { rate_timer_ref = TRef }) ->
     {ok, cancel} = timer:cancel(TRef),
     State #state { rate_timer_ref = undefined }.
+
+enqueue_message(Txn, Message, ChPid, State = #state { sender_queues = SQ }) ->
+    Q = case dict:find(ChPid, SQ) of
+            {ok, Q1} -> Q1;
+            error    -> queue:new()
+        end,
+    SQ1 = dict:store(ChPid, queue:in({Txn, Message}, Q), SQ),
+    State1 = State #state { sender_queues = SQ1 },
+    case queue:is_empty(Q) of
+        true  -> process_instructions(State1);
+        false -> State1
+    end.
+
+process_instructions(State = #state { instructions        = InstrQ,
+                                      sender_queues       = SQ,
+                                      backing_queue       = BQ,
+                                      backing_queue_state = BQS,
+                                      guid_ack            = GA }) ->
+    case queue:out(InstrQ) of
+        {empty, _InstrQ} ->
+            State;
+
+        {{value, {publish, Deliver, Guid, MsgProps, ChPid}}, InstrQ1} ->
+            case dict:find(ChPid, SQ) of
+                error ->
+                    State; %% blocked
+                {ok, Q} ->
+                    case queue:out(Q) of
+                        {empty, _Q} ->
+                            State; %% blocked
+                        {{value, {_Txn, Msg = #basic_message { guid = Guid }}},
+                         Q1} ->
+                            State1 = State #state { instructions  = InstrQ1,
+                                                    sender_queues = dict:store(ChPid, Q1, SQ) },
+                            process_instructions(
+                              case Deliver of
+                                  false ->
+                                      BQS1 = BQ:publish(Msg, MsgProps, ChPid, BQS),
+                                      State1 #state { backing_queue_state = BQS1 };
+                                  {true, AckRequired} ->
+                                      {AckTag, BQS1} = BQ:publish_delivered(
+                                                         AckRequired, Msg, MsgProps, ChPid, BQS),
+                                      GA1 = case AckRequired of
+                                                true  -> dict:store(Guid, AckTag, GA);
+                                                false -> GA
+                                            end,
+                                      State1 #state { backing_queue_state = BQS1,
+                                                      guid_ack            = GA1 }
+                              end);
+                        {{value, {_Txn, #basic_message {}}}, _Q1} ->
+                            %% throw away the instruction: we'll never
+                            %% receive the message to which it
+                            %% corresponds.
+                            process_instructions(
+                              State #state { instructions = InstrQ1 })
+                    end
+            end;
+
+        {{value, {set_length, Length}}, InstrQ1} ->
+            QLen = BQ:len(BQS),
+            ToDrop = QLen - Length,
+            process_instructions(
+              case ToDrop > 0 of
+                  true ->
+                      BQS1 = lists:foldl(
+                               fun (const, BQSN) -> BQ:fetch(false, BQSN) end,
+                               BQS, lists:duplicate(ToDrop, const)),
+                      State #state { instructions        = InstrQ1,
+                                     backing_queue_state = BQS };
+                  false ->
+                      State #state { instructions = InstrQ1 }
+              end);
+
+        {{value, {fetch, AckRequired, Guid, Remaining}}, InstrQ1} ->
+            QLen = BQ:len(BQS),
+            State1 = State #state { instructions = InstrQ1 },
+            process_instructions(
+              case QLen - 1 of
+                  Remaining ->
+                      {{_Msg, _IsDelivered, AckTag, Remaining}, BQS1} =
+                          BQ:fetch(AckRequired, BQS),
+                      GA1 = case AckRequired of
+                                true  -> dict:store(Guid, AckTag, GA);
+                                false -> GA
+                            end,
+                      State1 #state { backing_queue_state = BQS1,
+                                      guid_ack            = GA1 };
+                  Other when Other < Remaining ->
+                      %% we must be shorter than the master
+                      State1
+              end);
+
+        {{value, {ack, Guids}}, InstrQ1} ->
+            {AckTags, GA1} =
+                lists:foldl(
+                  fun (Guid, {AckTagsN, GAN}) ->
+                          case dict:find(Guid, GA) of
+                              error        -> {AckTagsN, GAN};
+                              {ok, AckTag} -> {[AckTag | AckTagsN],
+                                               dict:erase(Guid, GA)}
+                          end
+                  end, {[], GA}, Guids),
+            {Guids1, BQS1} = BQ:ack(AckTags, BQS),
+            [] = Guids1 -- Guids, %% ASSERTION
+            process_instructions(
+              State #state { instructions = InstrQ1,
+                             guid_ack     = GA1,
+                             backing_queue_state = BQS1 })
+
+    end.

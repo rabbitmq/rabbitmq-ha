@@ -88,12 +88,11 @@ purge(#state {} = State) ->
     {0, State}.
 
 publish(Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish, Guid, MsgProps, ChPid})
+    %% gm:broadcast(GM, {publish, false, Guid, MsgProps, ChPid})
     State.
 
 publish_delivered(AckRequired, Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish_delivered, AckRequired, Guid, MsgProps, ChPid})
-    %% prefix acktag with self()
+    %% gm:broadcast(GM, {publish, {true, AckRequired}, Guid, MsgProps, ChPid})
     {blank_ack, State}.
 
 dropwhile(Fun, #state {} = State) ->
@@ -101,8 +100,10 @@ dropwhile(Fun, #state {} = State) ->
     State.
 
 fetch(AckRequired, #state {} = State) ->
-    %% gm:broadcast(GM, {fetch, Guid})
-    %% prefix acktag with self()
+    %% case fetch of
+    %%   empty -> do nothing;
+    %%   {Msg, Remaining} -> gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining})
+    %% end
     {empty, State}.
 
 ack(AckTags, #state {} = State) ->
