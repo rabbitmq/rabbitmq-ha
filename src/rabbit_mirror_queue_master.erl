@@ -34,7 +34,9 @@
 
 -record(state, { coordinator,
                  backing_queue,
-                 backing_queue_state
+                 backing_queue_state,
+
+                 guid_ack %% :: Guid -> AckTag
                }).
 
 %% ---------------------------------------------------------------------------
@@ -60,12 +62,14 @@ init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
     BQS = BQ:init(Q, Recover),
     #state { coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS }.
+             backing_queue_state = BQS,
+             guid_ack            = dict:new() }.
 
 promote_backing_queue_state(CPid, BQ, BQS) ->
     #state { coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS }.
+             backing_queue_state = BQS,
+             guid_ack            = dict:new() }.
 
 terminate(State = #state { backing_queue = BQ, backing_queue_state = BQS }) ->
     %% Backing queue termination. The queue is going down but
@@ -80,7 +84,7 @@ delete_and_terminate(State = #state { backing_queue       = BQ,
     State #state { backing_queue_state = BQ:delete_and_terminate(BQS) }.
 
 purge(#state {} = State) ->
-    %% get count and gm:broadcast(GM, {drop_next, Count})
+    %% gm:broadcast(GM, {set_length, 0})
     {0, State}.
 
 publish(Msg, MsgProps, ChPid, #state {} = State) ->
@@ -93,8 +97,7 @@ publish_delivered(AckRequired, Msg, MsgProps, ChPid, #state {} = State) ->
     {blank_ack, State}.
 
 dropwhile(Fun, #state {} = State) ->
-    %% DropCount = len(State) - len(State1),
-    %% gm:broadcast(GM, {drop_next, DropCount})
+    %% gm:broadcast(GM, {set_length, len(State1)})
     State.
 
 fetch(AckRequired, #state {} = State) ->
@@ -104,7 +107,6 @@ fetch(AckRequired, #state {} = State) ->
 
 ack(AckTags, #state {} = State) ->
     %% gm:broadcast(GM, {ack, Guids})
-    %% drop any acktags which do not have self() prefix
     State.
 
 tx_publish(Txn, Msg, MsgProps, ChPid, #state {} = State) ->

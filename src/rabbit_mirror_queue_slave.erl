@@ -27,32 +27,39 @@
 %% distinguish between GM instructions arriving early, and case (1)
 %% above.
 %%
-%% Thus, per sender, we need two queues: one to hold messages from
-%% publishers, and one to hold instructions from the GM group. It's
-%% always the case that only one of these queues will ever be
-%% non-empty (thus the implementation might actually get away with
-%% just one queue).
+%% All instructions from the GM group must be processed in the order
+%% in which they're received.
+%%
+%% Thus, we need a queue per sender, and a queue for GM instructions.
 %%
 %% On receipt of a GM group instruction, three things are possible:
 %% 1. The queue of publisher messages is empty. Thus store the GM
-%% instruction to the relevant queue.
+%%    instruction to the instrQ.
 %% 2. The head of the queue of publisher messages has a message that
-%% matches the GUID of the GM instruction. Remove the message, and
-%% route appropriately.
+%%    matches the GUID of the GM instruction. Remove the message, and
+%%    route appropriately.
 %% 3. The head of the queue of publisher messages has a message that
-%% does not match the GUID of the GM instruction. Throw away the GM
-%% instruction.
+%%    does not match the GUID of the GM instruction. Throw away the GM
+%%    instruction: the GM instruction must correspond to a message
+%%    that we'll never receive. If it did not, then before the current
+%%    instruction, we would have received an instruction for the
+%%    message at the head of this queue, thus the head of the queue
+%%    would have been removed and processed.
 %%
 %% On receipt of a publisher message, three things are possible:
 %% 1. The queue of GM group instructions is empty. Add the message to
-%% the relevant queue and await instructions from the GM.
+%%    the relevant queue and await instructions from the GM.
 %% 2. The head of the queue of GM group instructions has an
-%% instruction matching the GUID of the message. Remove that
-%% instruction and act on it.
+%%    instruction matching the GUID of the message. Remove that
+%%    instruction and act on it. Attempt to process the rest of the
+%%    instrQ.
 %% 3. The head of the queue of GM group instructions has an
-%% instruction that does not match the GUID of the message. Throw away
-%% the GM group instruction and repeat - attempt to match against the
-%% next instruction if there is one.
+%%    instruction that does not match the GUID of the message. If the
+%%    message is from the same publisher as is referred to by the
+%%    instruction then throw away the GM group instruction and repeat
+%%    - attempt to match against the next instruction if there is one:
+%%    The instruction thrown away was for a message we'll never
+%%    receive.
 %%
 %% In all cases, we are relying heavily on order preserving messaging
 %% both from the GM group and from the publishers.
@@ -75,7 +82,12 @@
                  master_node,
                  backing_queue,
                  backing_queue_state,
-                 rate_timer_ref
+                 rate_timer_ref,
+
+                 queue_head,    %% :: undefined | Guid | locked <= coping with fetch
+                 sender_queues, %% :: Pid -> MsgQ
+                 guid_ack,      %% :: Guid -> AckTag
+                 instructions   %% :: InstrQ
                }).
 
 -define(RAM_DURATION_UPDATE_INTERVAL,  5000).
@@ -229,7 +241,9 @@ promote_me(From, #state { q                   = Q,
     {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, GM),
     true = unlink(GM),
     gen_server2:reply(From, {promote, CPid}),
-    ok = gm:broadcast(GM, heartbeat),
+    ok = gm:confirmed_broadcast(GM, heartbeat),
+    %% TODO: 1. requeue all pending acks; 2. issue publish msgs for
+    %% all unenqueued msgs
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
                     CPid, BQ, BQS),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
