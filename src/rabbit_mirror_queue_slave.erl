@@ -16,6 +16,47 @@
 
 -module(rabbit_mirror_queue_slave).
 
+%% We join the GM group before we add ourselves to the amqqueue
+%% record. As a result:
+%% 1. We can receive msgs from GM that correspond to messages we will
+%% never receive from publishers.
+%% 2. When we receive a message from publishers, we must receive a
+%% message from the GM group for it.
+%% 3. However, that instruction from the GM group can arrive either
+%% before or after the actual message. We need to be able to
+%% distinguish between GM instructions arriving early, and case (1)
+%% above.
+%%
+%% Thus, per sender, we need two queues: one to hold messages from
+%% publishers, and one to hold instructions from the GM group. It's
+%% always the case that only one of these queues will ever be
+%% non-empty (thus the implementation might actually get away with
+%% just one queue).
+%%
+%% On receipt of a GM group instruction, three things are possible:
+%% 1. The queue of publisher messages is empty. Thus store the GM
+%% instruction to the relevant queue.
+%% 2. The head of the queue of publisher messages has a message that
+%% matches the GUID of the GM instruction. Remove the message, and
+%% route appropriately.
+%% 3. The head of the queue of publisher messages has a message that
+%% does not match the GUID of the GM instruction. Throw away the GM
+%% instruction.
+%%
+%% On receipt of a publisher message, three things are possible:
+%% 1. The queue of GM group instructions is empty. Add the message to
+%% the relevant queue and await instructions from the GM.
+%% 2. The head of the queue of GM group instructions has an
+%% instruction matching the GUID of the message. Remove that
+%% instruction and act on it.
+%% 3. The head of the queue of GM group instructions has an
+%% instruction that does not match the GUID of the message. Throw away
+%% the GM group instruction and repeat - attempt to match against the
+%% next instruction if there is one.
+%%
+%% In all cases, we are relying heavily on order preserving messaging
+%% both from the GM group and from the publishers.
+
 -export([start_link/1, set_maximum_since_use/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
