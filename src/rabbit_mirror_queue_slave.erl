@@ -101,7 +101,7 @@ init([#amqqueue { name = QueueName } = Q]) ->
     process_flag(trap_exit, true), %% amqqueue_process traps exits too.
     ok = gm:create_tables(),
     {ok, GM} = gm:start_link(QueueName, ?MODULE, [self()]),
-    receive {joined, GM, Nodes} ->
+    receive {joined, GM} ->
             ok
     end,
     Self = self(),
@@ -146,15 +146,15 @@ init([#amqqueue { name = QueueName } = Q]) ->
             {stop, Error}
     end.
 
-handle_call({deliver_immediately, Txn, Message, ChPid}, From, State) ->
+handle_call({deliver_immediately, Delivery = #delivery {}}, From, State) ->
     %% Synchronous, "immediate" delivery mode
     gen_server2:reply(From, false), %% master may deliver it, not us
-    noreply(enqueue_message(Txn, Message, ChPid, State));
+    noreply(enqueue_message(Delivery, State));
 
-handle_call({deliver, Txn, Message, ChPid}, From, State) ->
+handle_call({deliver, Delivery = #delivery {}}, From, State) ->
     %% Synchronous, "mandatory" delivery mode
     gen_server2:reply(From, true), %% amqqueue throws away the result anyway
-    noreply(enqueue_message(Txn, Message, ChPid, State));
+    noreply(enqueue_message(Delivery, State));
 
 handle_call({gm_deaths, Deaths}, From,
             State = #state { q           = #amqqueue { name = QueueName },
@@ -174,9 +174,17 @@ handle_call({gm_deaths, Deaths}, From,
     end.
 
 
-handle_cast({deliver, Txn, Message, ChPid}, State) ->
+handle_cast({gm, Instruction}, State = #state { instructions = InstrQ }) ->
+    State1 = State #state { instructions = queue:in(Instruction, InstrQ) },
+    noreply(
+      case queue:is_empty(InstrQ) of
+          true  -> process_instructions(State1);
+          false -> State1
+      end);
+
+handle_cast({deliver, Delivery = #delivery {}}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
-    noreply(enqueue_message(Txn, Message, ChPid, State));
+    noreply(enqueue_message(Delivery, State));
 
 handle_cast({set_maximum_since_use, Age}, State) ->
     ok = file_handle_cache:set_maximum_since_use(Age),
@@ -186,17 +194,27 @@ handle_cast({set_ram_duration_target, Duration},
             State = #state { backing_queue       = BQ,
                              backing_queue_state = BQS }) ->
     BQS1 = BQ:set_ram_duration_target(Duration, BQS),
-    noreply(State #state { backing_queue_state = BQS1 }).
+    noreply(State #state { backing_queue_state = BQS1 });
+
+handle_cast(update_ram_duration,
+            State = #state { backing_queue = BQ,
+                             backing_queue_state = BQS }) ->
+    {RamDuration, BQS1} = BQ:ram_duration(BQS),
+    DesiredDuration =
+        rabbit_memory_monitor:report_ram_duration(self(), RamDuration),
+    BQS2 = BQ:set_ram_duration_target(DesiredDuration, BQS1),
+    noreply(State #state { rate_timer_ref = just_measured,
+                           backing_queue_state = BQS2 }).
 
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
 
-terminate(_Reason, State = #state {}) ->
+terminate(_Reason, #state {}) ->
     %% gen_server case
     %% TODO: figure out what to do with the backing queue. See
     %% amqqueue_process:terminate/2
     ok;
-terminate([SPid], Reason) ->
+terminate([_SPid], _Reason) ->
     %% gm case
     ok.
 
@@ -217,8 +235,8 @@ handle_pre_hibernate(State = #state { backing_queue       = BQ,
 %% GM
 %% ---------------------------------------------------------------------------
 
-joined([SPid], Members) ->
-    SPid ! {joined, self(), [node(Pid) || Pid <- Members]},
+joined([SPid], _Members) ->
+    SPid ! {joined, self()},
     ok.
 
 members_changed([SPid], Births, Deaths) ->
@@ -229,10 +247,9 @@ members_changed([SPid], Births, Deaths) ->
     end.
 
 handle_msg([_SPid], _From, heartbeat) ->
-    io:format("S: ~p~n", [_SPid]),
     ok;
-handle_msg([SPid], From, Msg) ->
-    ok.
+handle_msg([SPid], _From, Msg) ->
+    ok = gen_server2:cast(SPid, {gm, Msg}).
 
 %% ---------------------------------------------------------------------------
 %% Others
@@ -251,7 +268,7 @@ promote_me(From, #state { q                   = Q,
     %% TODO: 1. requeue all pending acks; 2. issue publish msgs for
     %% all unenqueued msgs
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
-                    CPid, BQ, BQS),
+                    CPid, BQ, BQS, GM),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
                    Q, rabbit_mirror_queue_master, MasterState, RateTRef),
     {become, rabbit_amqqueue_process, QueueState, hibernate}.
@@ -285,12 +302,13 @@ stop_rate_timer(State = #state { rate_timer_ref = TRef }) ->
     {ok, cancel} = timer:cancel(TRef),
     State #state { rate_timer_ref = undefined }.
 
-enqueue_message(Txn, Message, ChPid, State = #state { sender_queues = SQ }) ->
+enqueue_message(Delivery = #delivery { sender = ChPid },
+                State = #state { sender_queues = SQ }) ->
     Q = case dict:find(ChPid, SQ) of
             {ok, Q1} -> Q1;
             error    -> queue:new()
         end,
-    SQ1 = dict:store(ChPid, queue:in({Txn, Message}, Q), SQ),
+    SQ1 = dict:store(ChPid, queue:in(Delivery, Q), SQ),
     State1 = State #state { sender_queues = SQ1 },
     case queue:is_empty(Q) of
         true  -> process_instructions(State1);
@@ -314,7 +332,8 @@ process_instructions(State = #state { instructions        = InstrQ,
                     case queue:out(Q) of
                         {empty, _Q} ->
                             State; %% blocked
-                        {{value, {_Txn, Msg = #basic_message { guid = Guid }}},
+                        {{value, #delivery { txn = none,
+                                             message = Msg = #basic_message { guid = Guid } }},
                          Q1} ->
                             State1 = State #state { instructions  = InstrQ1,
                                                     sender_queues = dict:store(ChPid, Q1, SQ) },
@@ -333,7 +352,7 @@ process_instructions(State = #state { instructions        = InstrQ,
                                       State1 #state { backing_queue_state = BQS1,
                                                       guid_ack            = GA1 }
                               end);
-                        {{value, {_Txn, #basic_message {}}}, _Q1} ->
+                        {{value, #delivery {}}, _Q1} ->
                             %% throw away the instruction: we'll never
                             %% receive the message to which it
                             %% corresponds.
@@ -352,7 +371,7 @@ process_instructions(State = #state { instructions        = InstrQ,
                                fun (const, BQSN) -> BQ:fetch(false, BQSN) end,
                                BQS, lists:duplicate(ToDrop, const)),
                       State #state { instructions        = InstrQ1,
-                                     backing_queue_state = BQS };
+                                     backing_queue_state = BQS1 };
                   false ->
                       State #state { instructions = InstrQ1 }
               end);
@@ -389,8 +408,8 @@ process_instructions(State = #state { instructions        = InstrQ,
             {Guids1, BQS1} = BQ:ack(AckTags, BQS),
             [] = Guids1 -- Guids, %% ASSERTION
             process_instructions(
-              State #state { instructions = InstrQ1,
-                             guid_ack     = GA1,
+              State #state { instructions        = InstrQ1,
+                             guid_ack            = GA1,
                              backing_queue_state = BQS1 })
 
     end.

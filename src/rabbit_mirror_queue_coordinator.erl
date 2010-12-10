@@ -16,7 +16,7 @@
 
 -module(rabbit_mirror_queue_coordinator).
 
--export([start_link/2, add_slave/2]).
+-export([start_link/2, add_slave/2, get_gm/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -41,6 +41,9 @@ start_link(Queue, GM) ->
 add_slave(CPid, SlaveNode) ->
     gen_server2:cast(CPid, {add_slave, SlaveNode}).
 
+get_gm(CPid) ->
+    gen_server2:call(CPid, get_gm, infinity).
+
 %% ---------------------------------------------------------------------------
 %% gen_server
 %% ---------------------------------------------------------------------------
@@ -63,8 +66,8 @@ init([#amqqueue { name = QueueName } = Q, GM]) ->
     {ok, #state { q = Q, gm = GM1 }, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
 
-handle_call(Msg, _From, State) ->
-    {stop, {unexpected_call, Msg}, State}.
+handle_call(get_gm, _From, State = #state { gm = GM }) ->
+    reply(GM, State).
 
 handle_cast({add_slave, Node}, State = #state { q = Q }) ->
     Result = rabbit_mirror_queue_slave_sup:start_child(Node, [Q]),
@@ -72,8 +75,7 @@ handle_cast({add_slave, Node}, State = #state { q = Q }) ->
     noreply(State);
 
 handle_cast({gm_deaths, Deaths},
-            State = #state { gm = GM,
-                             q  = #amqqueue { name = QueueName } }) ->
+            State = #state { q  = #amqqueue { name = QueueName } }) ->
     io:format("Coord (~p) got deaths: ~p~n", [self(), Deaths]),
     Node = node(),
     Node = node(rabbit_mirror_queue_misc:remove_from_queue(QueueName, Deaths)),
@@ -82,10 +84,10 @@ handle_cast({gm_deaths, Deaths},
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
 
-terminate(_Reason, State = #state{}) ->
+terminate(_Reason, #state{}) ->
     %% gen_server case
     ok;
-terminate([CPid], Reason) ->
+terminate([_CPid], _Reason) ->
     %% gm case
     ok.
 
@@ -105,9 +107,8 @@ members_changed([CPid], Births, Deaths) ->
     ok = gen_server2:cast(CPid, {gm_deaths, Deaths}).
 
 handle_msg([_CPid], _From, heartbeat) ->
-    io:format("C ~p~n", [_CPid]),
     ok;
-handle_msg([CPid], From, Msg) ->
+handle_msg([_CPid], _From, _Msg) ->
     ok.
 
 %% ---------------------------------------------------------------------------

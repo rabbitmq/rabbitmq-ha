@@ -26,17 +26,16 @@
 
 -export([start/1, stop/0]).
 
--export([promote_backing_queue_state/3]).
+-export([promote_backing_queue_state/4]).
 
 -behaviour(rabbit_backing_queue).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--record(state, { coordinator,
+-record(state, { gm,
+                 coordinator,
                  backing_queue,
-                 backing_queue_state,
-
-                 guid_ack %% :: Guid -> AckTag
+                 backing_queue_state
                }).
 
 %% ---------------------------------------------------------------------------
@@ -55,21 +54,22 @@ stop() ->
 init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
     {ok, CPid} =
         rabbit_mirror_queue_coordinator:start_link(Q, undefined),
+    GM = rabbit_mirror_queue_coordinator:get_gm(CPid),
     {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
     [rabbit_mirror_queue_coordinator:add_slave(CPid, binary_to_atom(Node, utf8))
      || {longstr, Node} <- Nodes],
     {ok, BQ} = application:get_env(backing_queue_module),
     BQS = BQ:init(Q, Recover),
-    #state { coordinator         = CPid,
+    #state { gm                  = GM,
+             coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS,
-             guid_ack            = dict:new() }.
+             backing_queue_state = BQS }.
 
-promote_backing_queue_state(CPid, BQ, BQS) ->
-    #state { coordinator         = CPid,
+promote_backing_queue_state(CPid, BQ, BQS, GM) ->
+    #state { gm                  = GM,
+             coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS,
-             guid_ack            = dict:new() }.
+             backing_queue_state = BQS }.
 
 terminate(State = #state { backing_queue = BQ, backing_queue_state = BQS }) ->
     %% Backing queue termination. The queue is going down but
@@ -83,32 +83,59 @@ delete_and_terminate(State = #state { backing_queue       = BQ,
     %% try and promote themselves.
     State #state { backing_queue_state = BQ:delete_and_terminate(BQS) }.
 
-purge(#state {} = State) ->
-    %% gm:broadcast(GM, {set_length, 0})
-    {0, State}.
+purge(State = #state { gm                  = GM,
+                       backing_queue       = BQ,
+                       backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {set_length, 0}),
+    {Count, BQS1} = BQ:purge(BQS),
+    {Count, State #state { backing_queue_state = BQS1 }}.
 
-publish(Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish, false, Guid, MsgProps, ChPid})
-    State.
+publish(Msg = #basic_message { guid = Guid },
+        MsgProps, ChPid, State = #state { gm                  = GM,
+                                          backing_queue       = BQ,
+                                          backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {publish, false, Guid, MsgProps, ChPid}),
+    BQS1 = BQ:publish(Msg, MsgProps, ChPid, BQS),
+    State #state { backing_queue_state = BQS1 }.
 
-publish_delivered(AckRequired, Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish, {true, AckRequired}, Guid, MsgProps, ChPid})
-    {blank_ack, State}.
+publish_delivered(AckRequired, Msg = #basic_message { guid = Guid },
+                  MsgProps, ChPid,
+                  State = #state { gm                  = GM,
+                                   backing_queue       = BQ,
+                                   backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {publish, {true, AckRequired}, Guid, MsgProps, ChPid}),
+    {AckTag, BQS1} = BQ:publish_delivered(AckRequired, Msg, MsgProps, ChPid, BQS),
+    {AckTag, State #state { backing_queue_state = BQS1 }}.
 
-dropwhile(Fun, #state {} = State) ->
-    %% gm:broadcast(GM, {set_length, len(State1)})
-    State.
+dropwhile(Fun, State = #state { gm                  = GM,
+                                backing_queue       = BQ,
+                                backing_queue_state = BQS }) ->
+    BQS1 = BQ:dropwhile(Fun, BQS),
+    ok = gm:broadcast(GM, {set_length, BQ:len(BQS1)}),
+    State #state { backing_queue_state = BQS1 }.
 
-fetch(AckRequired, #state {} = State) ->
-    %% case fetch of
-    %%   empty -> do nothing;
-    %%   {Msg, Remaining} -> gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining})
-    %% end
-    {empty, State}.
+fetch(AckRequired, State = #state { gm                  = GM,
+                                    backing_queue       = BQ,
+                                    backing_queue_state = BQS }) ->
+    {Result, BQS1} = BQ:fetch(AckRequired, BQS),
+    State1 = State #state { backing_queue_state = BQS1 },
+    case Result of
+        empty ->
+            ok;
+        {#basic_message { guid = Guid }, _IsDelivered, _AckTag, Remaining} ->
+            ok = gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining})
+    end,
+    {Result, State1}.
 
-ack(AckTags, #state {} = State) ->
-    %% gm:broadcast(GM, {ack, Guids})
-    State.
+ack(AckTags, State = #state { gm                  = GM,
+                              backing_queue       = BQ,
+                              backing_queue_state = BQS }) ->
+    {Guids, BQS1} = BQ:ack(AckTags, BQS),
+    case Guids of
+        [] -> ok;
+        _  -> ok = gm:broadcast(GM, {ack, Guids})
+    end,
+    {Guids, State #state { backing_queue_state = BQS1 }}.
 
 tx_publish(Txn, Msg, MsgProps, ChPid, #state {} = State) ->
     %% gm:broadcast(GM, {tx_publish, Txn, Guid, MsgProps, ChPid})
