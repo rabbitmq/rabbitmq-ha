@@ -332,25 +332,34 @@ process_instructions(State = #state { instructions        = InstrQ,
                     case queue:out(Q) of
                         {empty, _Q} ->
                             State; %% blocked
-                        {{value, #delivery { txn = none,
-                                             message = Msg = #basic_message { guid = Guid } }},
-                         Q1} ->
-                            State1 = State #state { instructions  = InstrQ1,
-                                                    sender_queues = dict:store(ChPid, Q1, SQ) },
+                        {{value, #delivery {
+                            txn     = none,
+                            message = Msg =
+                                #basic_message { guid = Guid } }}, Q1} ->
+                            State1 = State #state {
+                                       instructions  = InstrQ1,
+                                       sender_queues =
+                                           dict:store(ChPid, Q1, SQ) },
                             process_instructions(
                               case Deliver of
                                   false ->
-                                      BQS1 = BQ:publish(Msg, MsgProps, ChPid, BQS),
-                                      State1 #state { backing_queue_state = BQS1 };
+                                      BQS1 =
+                                          BQ:publish(Msg, MsgProps, ChPid, BQS),
+                                      State1 #state {
+                                        backing_queue_state = BQS1 };
                                   {true, AckRequired} ->
-                                      {AckTag, BQS1} = BQ:publish_delivered(
-                                                         AckRequired, Msg, MsgProps, ChPid, BQS),
+                                      {AckTag, BQS1} =
+                                          BQ:publish_delivered(
+                                            AckRequired, Msg, MsgProps, ChPid,
+                                            BQS),
                                       GA1 = case AckRequired of
-                                                true  -> dict:store(Guid, AckTag, GA);
+                                                true  -> dict:store(
+                                                           Guid, AckTag, GA);
                                                 false -> GA
                                             end,
-                                      State1 #state { backing_queue_state = BQS1,
-                                                      guid_ack            = GA1 }
+                                      State1 #state {
+                                        backing_queue_state = BQS1,
+                                        guid_ack            = GA1 }
                               end);
                         {{value, #delivery {}}, _Q1} ->
                             %% throw away the instruction: we'll never
