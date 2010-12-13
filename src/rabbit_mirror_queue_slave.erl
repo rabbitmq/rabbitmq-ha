@@ -149,12 +149,12 @@ init([#amqqueue { name = QueueName } = Q]) ->
 handle_call({deliver_immediately, Delivery = #delivery {}}, From, State) ->
     %% Synchronous, "immediate" delivery mode
     gen_server2:reply(From, false), %% master may deliver it, not us
-    noreply(enqueue_message(Delivery, State));
+    handle_process_result(enqueue_message(Delivery, State));
 
 handle_call({deliver, Delivery = #delivery {}}, From, State) ->
     %% Synchronous, "mandatory" delivery mode
     gen_server2:reply(From, true), %% amqqueue throws away the result anyway
-    noreply(enqueue_message(Delivery, State));
+    handle_process_result(enqueue_message(Delivery, State));
 
 handle_call({gm_deaths, Deaths}, From,
             State = #state { q           = #amqqueue { name = QueueName },
@@ -176,15 +176,14 @@ handle_call({gm_deaths, Deaths}, From,
 
 handle_cast({gm, Instruction}, State = #state { instructions = InstrQ }) ->
     State1 = State #state { instructions = queue:in(Instruction, InstrQ) },
-    noreply(
-      case queue:is_empty(InstrQ) of
-          true  -> process_instructions(State1);
-          false -> State1
-      end);
+    case queue:is_empty(InstrQ) of
+        true  -> handle_process_result(process_instructions(State1));
+        false -> State1
+    end;
 
 handle_cast({deliver, Delivery = #delivery {}}, State) ->
     %% Asynchronous, non-"mandatory", non-"immediate" deliver mode.
-    noreply(enqueue_message(Delivery, State));
+    handle_process_result(enqueue_message(Delivery, State));
 
 handle_cast({set_maximum_since_use, Age}, State) ->
     ok = file_handle_cache:set_maximum_since_use(Age),
@@ -255,6 +254,9 @@ handle_msg([SPid], _From, Msg) ->
 %% Others
 %% ---------------------------------------------------------------------------
 
+handle_process_result({continue, State}) -> noreply(State);
+handle_process_result({stop, State}) -> {stop, normal, State}.
+
 promote_me(From, #state { q                   = Q,
                           gm                  = GM,
                           backing_queue       = BQ,
@@ -312,7 +314,7 @@ enqueue_message(Delivery = #delivery { sender = ChPid },
     State1 = State #state { sender_queues = SQ1 },
     case queue:is_empty(Q) of
         true  -> process_instructions(State1);
-        false -> State1
+        false -> {continue, State1}
     end.
 
 process_instructions(State = #state { instructions        = InstrQ,
@@ -322,16 +324,16 @@ process_instructions(State = #state { instructions        = InstrQ,
                                       guid_ack            = GA }) ->
     case queue:out(InstrQ) of
         {empty, _InstrQ} ->
-            State;
+            {continue, State};
 
         {{value, {publish, Deliver, Guid, MsgProps, ChPid}}, InstrQ1} ->
             case dict:find(ChPid, SQ) of
                 error ->
-                    State; %% blocked
+                    {continue, State}; %% blocked
                 {ok, Q} ->
                     case queue:out(Q) of
                         {empty, _Q} ->
-                            State; %% blocked
+                            {continue, State}; %% blocked
                         {{value, #delivery {
                             txn     = none,
                             message = Msg =
@@ -429,7 +431,12 @@ process_instructions(State = #state { instructions        = InstrQ,
                       State #state { instructions        = InstrQ1,
                                      guid_ack            = dict:new(),
                                      backing_queue_state = BQS1 }
-              end)
+              end);
+
+        {{value, delete_and_terminate}, InstrQ1} ->
+            {stop, State #state { instructions        = InstrQ1,
+                                  backing_queue_state =
+                                      BQ:delete_and_terminate(BQS) }}
 
     end.
 
