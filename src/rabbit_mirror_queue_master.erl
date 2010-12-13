@@ -171,9 +171,12 @@ tx_commit(Txn, PostCommitFun, MsgPropsFun, #state {} = State) ->
     %% directly.
     {[], State}.
 
-requeue(AckTags, MsgPropsFun, #state {} = State) ->
-    %% gm:broadcast(GM, {requeue, Guids}),
-    State.
+requeue(AckTags, MsgPropsFun, State = #state { gm                  = GM,
+                                               backing_queue       = BQ,
+                                               backing_queue_state = BQS }) ->
+    {Guids, BQS1} = BQ:requeue(AckTags, MsgPropsFun, BQS),
+    ok = gm:broadcast(GM, {requeue, MsgPropsFun, Guids}),
+    {Guids, State #state { backing_queue_state = BQS1 }}.
 
 len(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
     BQ:len(BQS).

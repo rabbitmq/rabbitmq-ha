@@ -396,20 +396,39 @@ process_instructions(State = #state { instructions        = InstrQ,
               end);
 
         {{value, {ack, Guids}}, InstrQ1} ->
-            {AckTags, GA1} =
-                lists:foldl(
-                  fun (Guid, {AckTagsN, GAN}) ->
-                          case dict:find(Guid, GA) of
-                              error        -> {AckTagsN, GAN};
-                              {ok, AckTag} -> {[AckTag | AckTagsN],
-                                               dict:erase(Guid, GA)}
-                          end
-                  end, {[], GA}, Guids),
+            {AckTags, GA1} = guids_to_acktags(Guids, GA),
             {Guids1, BQS1} = BQ:ack(AckTags, BQS),
             [] = Guids1 -- Guids, %% ASSERTION
             process_instructions(
               State #state { instructions        = InstrQ1,
                              guid_ack            = GA1,
-                             backing_queue_state = BQS1 })
+                             backing_queue_state = BQS1 });
+
+        {{value, {requeue, MsgPropsFun, Guids}}, InstrQ1} ->
+            {AckTags, GA1} = guids_to_acktags(Guids, GA),
+            process_instructions(
+              case length(AckTags) =:= length(Guids) of
+                  true ->
+                      {Guids, BQS1} = BQ:requeue(AckTags, MsgPropsFun, BQS),
+                      State #state { instructions        = InstrQ1,
+                                     guid_ack            = GA1,
+                                     backing_queue_state = BQS1 };
+                  false ->
+                      %% the only thing we can safely do is nuke out
+                      %% our BQ and GA
+                      {_Count, BQS1} = BQ:purge(BQS),
+                      State #state { instructions        = InstrQ1,
+                                     guid_ack            = dict:new(),
+                                     backing_queue_state = BQS1 }
+              end)
 
     end.
+
+guids_to_acktags(Guids, GA) ->
+    lists:foldl(fun (Guid, {AckTagsN, GAN}) ->
+                        case dict:find(Guid, GA) of
+                            error        -> {AckTagsN, GAN};
+                            {ok, AckTag} -> {[AckTag | AckTagsN],
+                                             dict:erase(Guid, GA)}
+                        end
+                end, {[], GA}, Guids).
