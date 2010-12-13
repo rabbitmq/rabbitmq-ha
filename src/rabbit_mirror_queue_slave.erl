@@ -261,18 +261,28 @@ promote_me(From, #state { q                   = Q,
                           gm                  = GM,
                           backing_queue       = BQ,
                           backing_queue_state = BQS,
-                          rate_timer_ref      = RateTRef }) ->
+                          rate_timer_ref      = RateTRef,
+                          sender_queues       = SQ,
+                          guid_ack            = GA }) ->
     io:format("Promoting ~p!~n", [self()]),
     {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, GM),
     true = unlink(GM),
     gen_server2:reply(From, {promote, CPid}),
     ok = gm:confirmed_broadcast(GM, heartbeat),
-    %% TODO: 1. requeue all pending acks; 2. issue publish msgs for
-    %% all unenqueued msgs
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
                     CPid, BQ, BQS, GM),
+    %% We have to do the requeue via this init because otherwise we
+    %% don't have access to the relevent MsgPropsFun. Also, we are
+    %% already in mnesia as the master queue pid. Thus we cannot just
+    %% publish stuff by sending it to ourself - we must pass it
+    %% through to this init, otherwise we can violate ordering
+    %% constraints.
+    AckTags = [AckTag || {_Guid, AckTag} <- dict:to_list(GA)],
+    Deliveries = lists:append([queue:to_list(Q)
+                               || {_ChPid, Q} <- dict:to_list(SQ)]),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
-                   Q, rabbit_mirror_queue_master, MasterState, RateTRef),
+                   Q, rabbit_mirror_queue_master, MasterState, RateTRef,
+                   AckTags, Deliveries),
     {become, rabbit_amqqueue_process, QueueState, hibernate}.
 
 noreply(State) ->
@@ -428,10 +438,7 @@ process_instructions(State = #state { instructions        = InstrQ,
                       %% the only thing we can safely do is nuke out
                       %% our BQ and GA
                       {_Count, BQS1} = BQ:purge(BQS),
-                      {Guids, BQS2} =
-                          BQ:ack(
-                            [AckTag || {_Guid, AckTag} <- dict:to_list(GA)],
-                            BQS1),
+                      {Guids, BQS2} = ack_all(BQ, GA, BQS1),
                       State #state { instructions        = InstrQ1,
                                      guid_ack            = dict:new(),
                                      backing_queue_state = BQS2 }
@@ -452,3 +459,6 @@ guids_to_acktags(Guids, GA) ->
                                              dict:erase(Guid, GA)}
                         end
                 end, {[], GA}, Guids).
+
+ack_all(BQ, GA, BQS) ->
+    BQ:ack([AckTag || {_Guid, AckTag} <- dict:to_list(GA)], BQS).
