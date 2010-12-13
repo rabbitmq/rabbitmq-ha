@@ -428,9 +428,13 @@ process_instructions(State = #state { instructions        = InstrQ,
                       %% the only thing we can safely do is nuke out
                       %% our BQ and GA
                       {_Count, BQS1} = BQ:purge(BQS),
+                      {Guids, BQS2} =
+                          BQ:ack(
+                            [AckTag || {_Guid, AckTag} <- dict:to_list(GA)],
+                            BQS1),
                       State #state { instructions        = InstrQ1,
                                      guid_ack            = dict:new(),
-                                     backing_queue_state = BQS1 }
+                                     backing_queue_state = BQS2 }
               end);
 
         {{value, delete_and_terminate}, InstrQ1} ->
