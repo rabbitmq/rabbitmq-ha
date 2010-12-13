@@ -35,7 +35,8 @@
 -record(state, { gm,
                  coordinator,
                  backing_queue,
-                 backing_queue_state
+                 backing_queue_state,
+                 set_delivered
                }).
 
 %% ---------------------------------------------------------------------------
@@ -63,13 +64,15 @@ init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
     #state { gm                  = GM,
              coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS }.
+             backing_queue_state = BQS,
+             set_delivered       = 0 }.
 
 promote_backing_queue_state(CPid, BQ, BQS, GM) ->
     #state { gm                  = GM,
              coordinator         = CPid,
              backing_queue       = BQ,
-             backing_queue_state = BQS }.
+             backing_queue_state = BQS,
+             set_delivered       = BQ:len(BQS) }.
 
 terminate(State = #state { backing_queue = BQ, backing_queue_state = BQS }) ->
     %% Backing queue termination. The queue is going down but
@@ -81,14 +84,16 @@ delete_and_terminate(State = #state { gm                  = GM,
                                       backing_queue       = BQ,
                                       backing_queue_state = BQS }) ->
     ok = gm:broadcast(GM, delete_and_terminate),
-    State #state { backing_queue_state = BQ:delete_and_terminate(BQS) }.
+    State #state { backing_queue_state = BQ:delete_and_terminate(BQS),
+                   set_delivered       = 0 }.
 
 purge(State = #state { gm                  = GM,
                        backing_queue       = BQ,
                        backing_queue_state = BQS }) ->
     ok = gm:broadcast(GM, {set_length, 0}),
     {Count, BQS1} = BQ:purge(BQS),
-    {Count, State #state { backing_queue_state = BQS1 }}.
+    {Count, State #state { backing_queue_state = BQS1,
+                           set_delivered       = 0 }}.
 
 publish(Msg = #basic_message { guid = Guid },
         MsgProps, ChPid, State = #state { gm                  = GM,
@@ -109,23 +114,33 @@ publish_delivered(AckRequired, Msg = #basic_message { guid = Guid },
 
 dropwhile(Fun, State = #state { gm                  = GM,
                                 backing_queue       = BQ,
-                                backing_queue_state = BQS }) ->
+                                backing_queue_state = BQS,
+                                set_delivered       = SetDelivered }) ->
+    Len = BQ:len(BQS),
     BQS1 = BQ:dropwhile(Fun, BQS),
+    Dropped = Len - BQ:len(BQS1),
+    SetDelivered1 = lists:max([0, SetDelivered - Dropped]),
     ok = gm:broadcast(GM, {set_length, BQ:len(BQS1)}),
-    State #state { backing_queue_state = BQS1 }.
+    State #state { backing_queue_state = BQS1,
+                   set_delivered       = SetDelivered1 }.
 
 fetch(AckRequired, State = #state { gm                  = GM,
                                     backing_queue       = BQ,
-                                    backing_queue_state = BQS }) ->
+                                    backing_queue_state = BQS,
+                                    set_delivered       = SetDelivered }) ->
     {Result, BQS1} = BQ:fetch(AckRequired, BQS),
     State1 = State #state { backing_queue_state = BQS1 },
     case Result of
         empty ->
-            ok;
-        {#basic_message { guid = Guid }, _IsDelivered, _AckTag, Remaining} ->
-            ok = gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining})
-    end,
-    {Result, State1}.
+            {Result, State1};
+        {#basic_message { guid = Guid } = Message, IsDelivered, AckTag,
+         Remaining} ->
+            ok = gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining}),
+            IsDelivered1 = IsDelivered orelse SetDelivered > 0,
+            SetDelivered1 = lists:max([0, SetDelivered - 1]),
+            {{Message, IsDelivered1, AckTag, Remaining},
+             State1 #state { set_delivered = SetDelivered1 }}
+    end.
 
 ack(AckTags, State = #state { gm                  = GM,
                               backing_queue       = BQ,

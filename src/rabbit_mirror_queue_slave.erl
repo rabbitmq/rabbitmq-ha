@@ -278,8 +278,8 @@ promote_me(From, #state { q                   = Q,
     %% through to this init, otherwise we can violate ordering
     %% constraints.
     AckTags = [AckTag || {_Guid, AckTag} <- dict:to_list(GA)],
-    Deliveries = lists:append([queue:to_list(Q)
-                               || {_ChPid, Q} <- dict:to_list(SQ)]),
+    Deliveries = lists:append([queue:to_list(PubQ)
+                               || {_ChPid, PubQ} <- dict:to_list(SQ)]),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
                    Q, rabbit_mirror_queue_master, MasterState, RateTRef,
                    AckTags, Deliveries),
