@@ -255,7 +255,7 @@ handle_msg([SPid], _From, Msg) ->
 %% ---------------------------------------------------------------------------
 
 handle_process_result({continue, State}) -> noreply(State);
-handle_process_result({stop, State}) -> {stop, normal, State}.
+handle_process_result({stop,     State}) -> {stop, normal, State}.
 
 promote_me(From, #state { q                   = Q,
                           gm                  = GM,
