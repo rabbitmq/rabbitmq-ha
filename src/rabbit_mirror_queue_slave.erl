@@ -179,7 +179,7 @@ handle_cast({gm, Instruction}, State = #state { instructions = InstrQ }) ->
     State1 = State #state { instructions = queue:in(Instruction, InstrQ) },
     case queue:is_empty(InstrQ) of
         true  -> handle_process_result(process_instructions(State1));
-        false -> State1
+        false -> noreply(State1)
     end;
 
 handle_cast({deliver, Delivery = #delivery {}}, State) ->
@@ -455,13 +455,15 @@ process_instructions(State = #state { instructions        = InstrQ,
     end.
 
 guids_to_acktags(Guids, GA) ->
-    lists:foldl(fun (Guid, {AckTagsN, GAN}) ->
-                        case dict:find(Guid, GA) of
-                            error        -> {AckTagsN, GAN};
-                            {ok, AckTag} -> {[AckTag | AckTagsN],
-                                             dict:erase(Guid, GA)}
-                        end
-                end, {[], GA}, Guids).
+    {AckTags, GA1} =
+        lists:foldl(fun (Guid, {AckTagsN, GAN}) ->
+                            case dict:find(Guid, GA) of
+                                error        -> {AckTagsN, GAN};
+                                {ok, AckTag} -> {[AckTag | AckTagsN],
+                                                 dict:erase(Guid, GAN)}
+                            end
+                    end, {[], GA}, Guids),
+    {lists:reverse(AckTags), GA1}.
 
 ack_all(BQ, GA, BQS) ->
     BQ:ack([AckTag || {_Guid, AckTag} <- dict:to_list(GA)], BQS).
