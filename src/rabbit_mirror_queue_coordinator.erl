@@ -71,12 +71,14 @@ handle_call(get_gm, _From, State = #state { gm = GM }) ->
 
 handle_cast({add_slave, Node}, State = #state { q = Q }) ->
     Result = rabbit_mirror_queue_slave_sup:start_child(Node, [Q]),
-    io:format("Add Slave '~p' => ~p~n", [Node, Result]),
+    rabbit_log:info("Adding slave node for queue ~p: ~p~n",
+                    [Q #amqqueue.name, Result]),
     noreply(State);
 
 handle_cast({gm_deaths, Deaths},
             State = #state { q  = #amqqueue { name = QueueName } }) ->
-    io:format("Coord (~p) got deaths: ~p~n", [self(), Deaths]),
+    rabbit_log:info("Master ~p saw deaths ~p for queue ~p~n",
+                    [self(), Deaths, QueueName]),
     Node = node(),
     Node = node(rabbit_mirror_queue_misc:remove_from_queue(QueueName, Deaths)),
     noreply(State).
@@ -102,8 +104,9 @@ joined([CPid], Members) ->
     CPid ! {joined, self(), Members},
     ok.
 
+members_changed([_CPid], _Births, []) ->
+    ok;
 members_changed([CPid], Births, Deaths) ->
-    io:format("C: ~p ~p ~p~n", [CPid, Births, Deaths]),
     ok = gen_server2:cast(CPid, {gm_deaths, Deaths}).
 
 handle_msg([_CPid], _From, heartbeat) ->

@@ -53,8 +53,7 @@ stop() ->
     exit({not_valid_for_generic_backing_queue, ?MODULE}).
 
 init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
-    {ok, CPid} =
-        rabbit_mirror_queue_coordinator:start_link(Q, undefined),
+    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, undefined),
     GM = rabbit_mirror_queue_coordinator:get_gm(CPid),
     {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
     [rabbit_mirror_queue_coordinator:add_slave(CPid, binary_to_atom(Node, utf8))
@@ -162,7 +161,7 @@ tx_ack(Txn, AckTags, #state {} = State) ->
 
 tx_rollback(Txn, #state {} = State) ->
     %% gm:broadcast(GM, {tx_rollback, Txn})
-    State.
+    {[], State}.
 
 tx_commit(Txn, PostCommitFun, MsgPropsFun, #state {} = State) ->
     %% Maybe don't want to transmit the MsgPropsFun but what choice do

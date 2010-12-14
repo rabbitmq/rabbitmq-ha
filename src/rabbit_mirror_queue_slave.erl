@@ -160,7 +160,8 @@ handle_call({gm_deaths, Deaths}, From,
             State = #state { q           = #amqqueue { name = QueueName },
                              gm          = GM,
                              master_node = MNode }) ->
-    io:format("Slave (~p) got deaths: ~p~n", [self(), Deaths]),
+    rabbit_log:info("Slave ~p saw deaths ~p for queue ~p~n",
+                    [self(), Deaths, QueueName]),
     case {node(), node(rabbit_mirror_queue_misc:remove_from_queue(
                          QueueName, Deaths))} of
         {_Node, MNode} ->
@@ -238,8 +239,9 @@ joined([SPid], _Members) ->
     SPid ! {joined, self()},
     ok.
 
+members_changed([_SPid], _Births, []) ->
+    ok;
 members_changed([SPid], Births, Deaths) ->
-    io:format("S: ~p ~p ~p~n", [SPid, Births, Deaths]),
     case gen_server2:call(SPid, {gm_deaths, Deaths}) of
         ok              -> ok;
         {promote, CPid} -> {become, rabbit_mirror_queue_coordinator, [CPid]}
@@ -264,7 +266,8 @@ promote_me(From, #state { q                   = Q,
                           rate_timer_ref      = RateTRef,
                           sender_queues       = SQ,
                           guid_ack            = GA }) ->
-    io:format("Promoting ~p!~n", [self()]),
+    rabbit_log:info("Promoting slave ~p for queue ~p~n",
+                    [self(), Q #amqqueue.name]),
     {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, GM),
     true = unlink(GM),
     gen_server2:reply(From, {promote, CPid}),
