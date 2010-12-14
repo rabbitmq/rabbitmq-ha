@@ -106,7 +106,7 @@ joined([CPid], Members) ->
 
 members_changed([_CPid], _Births, []) ->
     ok;
-members_changed([CPid], Births, Deaths) ->
+members_changed([CPid], _Births, Deaths) ->
     ok = gen_server2:cast(CPid, {gm_deaths, Deaths}).
 
 handle_msg([_CPid], _From, heartbeat) ->

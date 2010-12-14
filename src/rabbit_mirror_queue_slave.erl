@@ -241,7 +241,7 @@ joined([SPid], _Members) ->
 
 members_changed([_SPid], _Births, []) ->
     ok;
-members_changed([SPid], Births, Deaths) ->
+members_changed([SPid], _Births, Deaths) ->
     case gen_server2:call(SPid, {gm_deaths, Deaths}) of
         ok              -> ok;
         {promote, CPid} -> {become, rabbit_mirror_queue_coordinator, [CPid]}
