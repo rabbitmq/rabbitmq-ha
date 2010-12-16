@@ -215,9 +215,11 @@ handle_info(Msg, State) ->
 %% back up. Thus we must assume we will be, and preserve anything we
 %% have on disk.
 terminate(Reason, #state { q                   = Q,
+                           gm                  = GM,
                            backing_queue       = BQ,
                            backing_queue_state = BQS,
                            rate_timer_ref      = RateTRef }) ->
+    ok = gm:leave(GM),
     QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
                    Q, BQ, BQS, RateTRef, [], []),
     rabbit_amqqueue_process:terminate(Reason, QueueState);
@@ -249,10 +251,16 @@ joined([SPid], _Members) ->
 members_changed([_SPid], _Births, []) ->
     ok;
 members_changed([SPid], _Births, Deaths) ->
-    case gen_server2:call(SPid, {gm_deaths, Deaths}) of
-        ok              -> ok;
-        {promote, CPid} -> {become, rabbit_mirror_queue_coordinator, [CPid]}
-    end.
+    rabbit_misc:with_exit_handler(
+      fun () -> {stop, normal} end,
+      fun () ->
+              case gen_server2:call(SPid, {gm_deaths, Deaths}) of
+                  ok ->
+                      ok;
+                  {promote, CPid} ->
+                      {become, rabbit_mirror_queue_coordinator, [CPid]}
+              end
+      end).
 
 handle_msg([_SPid], _From, heartbeat) ->
     ok;
