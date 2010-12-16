@@ -26,11 +26,18 @@
 
 -export([start/1, stop/0]).
 
+-export([promote_backing_queue_state/4]).
+
 -behaviour(rabbit_backing_queue).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--record(state, { coordinator, vq }).
+-record(state, { gm,
+                 coordinator,
+                 backing_queue,
+                 backing_queue_state,
+                 set_delivered
+               }).
 
 %% ---------------------------------------------------------------------------
 %% Backing queue
@@ -45,48 +52,104 @@ stop() ->
     %% Same as start/1.
     exit({not_valid_for_generic_backing_queue, ?MODULE}).
 
-init(#amqqueue { name = QueueName, arguments = Args, durable = false },
-     Recover) ->
-    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(QueueName),
+init(#amqqueue { arguments = Args, durable = false } = Q, Recover) ->
+    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q, undefined),
+    GM = rabbit_mirror_queue_coordinator:get_gm(CPid),
     {_Type, Nodes} = rabbit_misc:table_lookup(Args, <<"x-mirror">>),
     [rabbit_mirror_queue_coordinator:add_slave(CPid, binary_to_atom(Node, utf8))
      || {longstr, Node} <- Nodes],
-    #state { coordinator = CPid }.
+    {ok, BQ} = application:get_env(backing_queue_module),
+    BQS = BQ:init(Q, Recover),
+    #state { gm                  = GM,
+             coordinator         = CPid,
+             backing_queue       = BQ,
+             backing_queue_state = BQS,
+             set_delivered       = 0 }.
 
-terminate(#state {}) ->
-    %% backing queue termination
-    ok.
+promote_backing_queue_state(CPid, BQ, BQS, GM) ->
+    #state { gm                  = GM,
+             coordinator         = CPid,
+             backing_queue       = BQ,
+             backing_queue_state = BQS,
+             set_delivered       = BQ:len(BQS) }.
 
-delete_and_terminate(#state {} = State) ->
-    State.
+terminate(State = #state { backing_queue = BQ, backing_queue_state = BQS }) ->
+    %% Backing queue termination. The queue is going down but
+    %% shouldn't be deleted. Most likely safe shutdown of this
+    %% node. Thus just let some other slave take over.
+    State #state { backing_queue_state = BQ:terminate(BQS) }.
 
-purge(#state {} = State) ->
-    %% get count and gm:broadcast(GM, {drop_next, Count})
-    {0, State}.
+delete_and_terminate(State = #state { gm                  = GM,
+                                      backing_queue       = BQ,
+                                      backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, delete_and_terminate),
+    State #state { backing_queue_state = BQ:delete_and_terminate(BQS),
+                   set_delivered       = 0 }.
 
-publish(Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish, Guid, MsgProps, ChPid})
-    State.
+purge(State = #state { gm                  = GM,
+                       backing_queue       = BQ,
+                       backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {set_length, 0}),
+    {Count, BQS1} = BQ:purge(BQS),
+    {Count, State #state { backing_queue_state = BQS1,
+                           set_delivered       = 0 }}.
 
-publish_delivered(AckRequired, Msg, MsgProps, ChPid, #state {} = State) ->
-    %% gm:broadcast(GM, {publish_delivered, AckRequired, Guid, MsgProps, ChPid})
-    %% prefix acktag with self()
-    {blank_ack, State}.
+publish(Msg = #basic_message { guid = Guid },
+        MsgProps, ChPid, State = #state { gm                  = GM,
+                                          backing_queue       = BQ,
+                                          backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {publish, false, Guid, MsgProps, ChPid}),
+    BQS1 = BQ:publish(Msg, MsgProps, ChPid, BQS),
+    State #state { backing_queue_state = BQS1 }.
 
-dropwhile(Fun, #state {} = State) ->
-    %% DropCount = len(State) - len(State1),
-    %% gm:broadcast(GM, {drop_next, DropCount})
-    State.
+publish_delivered(AckRequired, Msg = #basic_message { guid = Guid },
+                  MsgProps, ChPid,
+                  State = #state { gm                  = GM,
+                                   backing_queue       = BQ,
+                                   backing_queue_state = BQS }) ->
+    ok = gm:broadcast(GM, {publish, {true, AckRequired}, Guid, MsgProps, ChPid}),
+    {AckTag, BQS1} = BQ:publish_delivered(AckRequired, Msg, MsgProps, ChPid, BQS),
+    {AckTag, State #state { backing_queue_state = BQS1 }}.
 
-fetch(AckRequired, #state {} = State) ->
-    %% gm:broadcast(GM, {fetch, Guid})
-    %% prefix acktag with self()
-    {empty, State}.
+dropwhile(Fun, State = #state { gm                  = GM,
+                                backing_queue       = BQ,
+                                backing_queue_state = BQS,
+                                set_delivered       = SetDelivered }) ->
+    Len = BQ:len(BQS),
+    BQS1 = BQ:dropwhile(Fun, BQS),
+    Dropped = Len - BQ:len(BQS1),
+    SetDelivered1 = lists:max([0, SetDelivered - Dropped]),
+    ok = gm:broadcast(GM, {set_length, BQ:len(BQS1)}),
+    State #state { backing_queue_state = BQS1,
+                   set_delivered       = SetDelivered1 }.
 
-ack(AckTags, #state {} = State) ->
-    %% gm:broadcast(GM, {ack, Guids})
-    %% drop any acktags which do not have self() prefix
-    State.
+fetch(AckRequired, State = #state { gm                  = GM,
+                                    backing_queue       = BQ,
+                                    backing_queue_state = BQS,
+                                    set_delivered       = SetDelivered }) ->
+    {Result, BQS1} = BQ:fetch(AckRequired, BQS),
+    State1 = State #state { backing_queue_state = BQS1 },
+    case Result of
+        empty ->
+            {Result, State1};
+        {#basic_message { guid = Guid } = Message, IsDelivered, AckTag,
+         Remaining} ->
+            ok = gm:broadcast(GM, {fetch, AckRequired, Guid, Remaining}),
+            IsDelivered1 = IsDelivered orelse SetDelivered > 0,
+            SetDelivered1 = lists:max([0, SetDelivered - 1]),
+            {{Message, IsDelivered1, AckTag, Remaining},
+             State1 #state { set_delivered = SetDelivered1 }}
+    end.
+
+ack(AckTags, State = #state { gm                  = GM,
+                              backing_queue       = BQ,
+                              backing_queue_state = BQS }) ->
+    {Guids, BQS1} = BQ:ack(AckTags, BQS),
+    case Guids of
+        [] -> ok;
+        _  -> ok = gm:broadcast(GM, {ack, Guids})
+    end,
+    {Guids, State #state { backing_queue_state = BQS1 }}.
 
 tx_publish(Txn, Msg, MsgProps, ChPid, #state {} = State) ->
     %% gm:broadcast(GM, {tx_publish, Txn, Guid, MsgProps, ChPid})
@@ -98,7 +161,7 @@ tx_ack(Txn, AckTags, #state {} = State) ->
 
 tx_rollback(Txn, #state {} = State) ->
     %% gm:broadcast(GM, {tx_rollback, Txn})
-    State.
+    {[], State}.
 
 tx_commit(Txn, PostCommitFun, MsgPropsFun, #state {} = State) ->
     %% Maybe don't want to transmit the MsgPropsFun but what choice do
@@ -122,30 +185,37 @@ tx_commit(Txn, PostCommitFun, MsgPropsFun, #state {} = State) ->
     %% directly.
     {[], State}.
 
-requeue(AckTags, MsgPropsFun, #state {} = State) ->
-    %% gm:broadcast(GM, {requeue, Guids}),
-    State.
+requeue(AckTags, MsgPropsFun, State = #state { gm                  = GM,
+                                               backing_queue       = BQ,
+                                               backing_queue_state = BQS }) ->
+    {Guids, BQS1} = BQ:requeue(AckTags, MsgPropsFun, BQS),
+    ok = gm:broadcast(GM, {requeue, MsgPropsFun, Guids}),
+    {Guids, State #state { backing_queue_state = BQS1 }}.
 
-len(#state {}) ->
-    0.
+len(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:len(BQS).
 
-is_empty(State) ->
-    0 =:= len(State).
+is_empty(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:is_empty(BQS).
 
-set_ram_duration_target(Target, #state {} = State) ->
-    State.
+set_ram_duration_target(Target, State = #state { backing_queue       = BQ,
+                                                 backing_queue_state = BQS}) ->
+    State #state { backing_queue_state =
+                       BQ:set_ram_duration_target(Target, BQS) }.
 
-ram_duration(#state {} = State) ->
-    {0, State}.
+ram_duration(State = #state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    {Result, BQS1} = BQ:ram_duration(BQS),
+    {Result, State #state { backing_queue_state = BQS1 }}.
 
-needs_idle_timeout(#state {} = State) ->
-    false.
+needs_idle_timeout(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:needs_idle_timeout(BQS).
 
-idle_timeout(#state {} = State) ->
-    State.
+idle_timeout(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:idle_timeout(BQS).
 
-handle_pre_hibernate(#state {} = State) ->
-    State.
+handle_pre_hibernate(State = #state { backing_queue       = BQ,
+                                      backing_queue_state = BQS}) ->
+    State #state { backing_queue_state = BQ:handle_pre_hibernate(BQS) }.
 
-status(#state {}) ->
-    [].
+status(#state { backing_queue = BQ, backing_queue_state = BQS}) ->
+    BQ:status(BQS).
