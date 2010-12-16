@@ -209,11 +209,18 @@ handle_cast(update_ram_duration,
 handle_info(Msg, State) ->
     {stop, {unexpected_info, Msg}, State}.
 
-terminate(_Reason, #state {}) ->
-    %% gen_server case
-    %% TODO: figure out what to do with the backing queue. See
-    %% amqqueue_process:terminate/2
-    ok;
+%% If the Reason is shutdown, or {shutdown, _}, it is not the queue
+%% being deleted: it's just the node going down. Even though we're a
+%% slave, we have no idea whether or not we'll be the only copy coming
+%% back up. Thus we must assume we will be, and preserve anything we
+%% have on disk.
+terminate(Reason, #state { q                   = Q,
+                           backing_queue       = BQ,
+                           backing_queue_state = BQS,
+                           rate_timer_ref      = RateTRef }) ->
+    QueueState = rabbit_amqqueue_process:init_with_backing_queue_state(
+                   Q, BQ, BQS, RateTRef, [], []),
+    rabbit_amqqueue_process:terminate(Reason, QueueState).
 terminate([_SPid], _Reason) ->
     %% gm case
     ok.
